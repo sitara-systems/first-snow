@@ -139,6 +139,8 @@ precision highp float;
 // that took and why a numeric pixel measurement, not a visual comparison,
 // is what actually confirmed it.
 uniform sampler2D uState;
+uniform sampler2D uStatePrev;
+uniform float uTemporalAlpha; // 0 = show uStatePrev, 1 = show uState
 uniform vec2 uPixel; // one screen pixel, in vUv (0..1) units
 in vec2 vUv;
 out vec4 outColor;
@@ -147,20 +149,33 @@ out vec4 outColor;
 // lattice magnified onto a much larger canvas produced a visible staircase
 // on every edge. Jittering before the shear reflects actual on-screen pixel
 // coverage; does not touch the simulation's own textures or filtering.
-float sampleV(vec2 uv){
+float sampleV(sampler2D tex, vec2 uv){
   vec2 centered = (uv - 0.5) * 2.0;
   vec2 simSpace = vec2(centered.x + centered.y/1.7320508, centered.y*1.1547005);
   vec2 simUv = simSpace*0.5 + 0.5;
   if (simUv.x < 0.0 || simUv.x > 1.0 || simUv.y < 0.0 || simUv.y > 1.0) return 0.0;
-  vec4 s = texture(uState, simUv);
+  vec4 s = texture(tex, simUv);
   return s.r > 0.5 ? clamp(s.b,0.0,1.0) : 0.0;
 }
+// Temporal smoothing between the two most recent simulation snapshots --
+// see PLAN.md's eleventh 2026-09-11 finding. A fast-maturing crystal (low
+// beta) only advances the simulation every few rendered frames (its whole
+// step budget is small, spread over the same fixed-duration window as
+// every other crystal), which without this reads as a visible jump every
+// couple of frames rather than smooth growth. Crossfading toward the new
+// snapshot over the real time until the *next* expected step, instead of
+// cutting to it immediately, hides that gap. For a crystal stepping every
+// frame already (high beta), uTemporalAlpha reaches 1 almost immediately
+// and this is a no-op -- smoothing only ever activates where the gap
+// exists.
 void main(){
   vec2 o1 = uPixel * vec2( 0.125,  0.375);
   vec2 o2 = uPixel * vec2( 0.375, -0.125);
   vec2 o3 = uPixel * vec2(-0.125, -0.375);
   vec2 o4 = uPixel * vec2(-0.375,  0.125);
-  float v = (sampleV(vUv+o1) + sampleV(vUv+o2) + sampleV(vUv+o3) + sampleV(vUv+o4)) * 0.25;
+  float vCur = (sampleV(uState,vUv+o1) + sampleV(uState,vUv+o2) + sampleV(uState,vUv+o3) + sampleV(uState,vUv+o4)) * 0.25;
+  float vPrev = (sampleV(uStatePrev,vUv+o1) + sampleV(uStatePrev,vUv+o2) + sampleV(uStatePrev,vUv+o3) + sampleV(uStatePrev,vUv+o4)) * 0.25;
+  float v = mix(vPrev, vCur, uTemporalAlpha);
   vec3 crystalColor = mix(vec3(0.02,0.027,0.039), vec3(0.93,0.96,1.0), v);
   outColor = vec4(crystalColor, 1.0);
 }
@@ -254,7 +269,7 @@ function createCrystalEngine({canvas, wrap, getParams, onComplete, onProgress}){
   const piDiffuse = programInfo(VS_SRC, FS_DIFFUSE_SRC, ['uState','uTexel']);
   const piUpdate = programInfo(VS_SRC, FS_UPDATE_SRC,
     ['uState','uTexel','uBeta','uTheta','uAlpha','uKappa','uMu','uUpsilon','uSigma','uStep','uSeed']);
-  const piView = programInfo(VS_SRC, FS_VIEW_SRC, ['uState','uPixel']);
+  const piView = programInfo(VS_SRC, FS_VIEW_SRC, ['uState','uStatePrev','uTemporalAlpha','uPixel']);
   const quadBuf = gl.createBuffer();
   gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
   gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1,1,-1,-1,1,1,1]), gl.STATIC_DRAW);
@@ -320,18 +335,40 @@ function createCrystalEngine({canvas, wrap, getParams, onComplete, onProgress}){
     return {gamma: p.gamma, beta: p.beta, sigma: p.sigma == null ? DEFAULT_SIGMA : p.sigma};
   }
 
+  // Temporal smoothing (see the view shader's own comment and PLAN.md's
+  // eleventh 2026-09-11 finding) needs a stable "previous simulation
+  // state" texture to crossfade from. bufs[1-cur] is NOT that -- it's a
+  // scratch buffer stepSimulation() overwrites every single step for the
+  // diffusion sub-pass (stepSimulation's ping-pong never actually
+  // alternates `cur`, by design, see that function). prevRenderBuf is a
+  // dedicated third texture, updated via a fast GPU-side blit (not a
+  // shader pass) immediately before each batch of new steps runs, so it
+  // always holds "the state as it looked before this frame's advance."
+  let prevRenderBuf, lastStepAt, stepIntervalMs;
+  function snapshotCurrentInto(destBuf){
+    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, bufs[cur].fbo);
+    gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, destBuf.fbo);
+    gl.blitFramebuffer(0,0,SIZE,SIZE, 0,0,SIZE,SIZE, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  }
+
   function resetCrystal(){
     if (bufs) { gl.deleteTexture(bufs[0].tex); gl.deleteTexture(bufs[1].tex);
                 gl.deleteFramebuffer(bufs[0].fbo); gl.deleteFramebuffer(bufs[1].fbo); }
+    if (prevRenderBuf) { gl.deleteTexture(prevRenderBuf.tex); gl.deleteFramebuffer(prevRenderBuf.fbo); }
     const params = readParams();
     bufs = [makeState(SIZE), makeState(SIZE)];
     cur = 0;
     gl.bindTexture(gl.TEXTURE_2D, bufs[0].tex);
     gl.texSubImage2D(gl.TEXTURE_2D,0,0,0,SIZE,SIZE,gl.RGBA,gl.FLOAT, initialData(SIZE, params.gamma));
+    prevRenderBuf = makeState(SIZE);
+    snapshotCurrentInto(prevRenderBuf); // starts identical to bufs[cur] -- no phantom fade-in on the very first frame
     stepCount = 0;
     seed = Date.now() % 100000; // deterministic given this value -- hard rule 3: seeded, not OS-entropy-unseeded
     running = true;
     startTime = performance.now();
+    lastStepAt = startTime;
+    stepIntervalMs = 16; // refined the first time tick() actually knows totalTarget
     renderView();
   }
 
@@ -367,11 +404,14 @@ function createCrystalEngine({canvas, wrap, getParams, onComplete, onProgress}){
   }
 
   function renderView(){
-    const finalBuf = bufs[cur];
+    const alpha = stepIntervalMs > 0 ? clamp01((performance.now() - lastStepAt) / stepIntervalMs) : 1;
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, finalBuf.tex);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, bufs[cur].tex);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, prevRenderBuf.tex);
     drawQuad(piView, canvas.width, canvas.height, u=>{
       gl.uniform1i(u.uState,0);
+      gl.uniform1i(u.uStatePrev,1);
+      gl.uniform1f(u.uTemporalAlpha, alpha);
       gl.uniform2f(u.uPixel, 1/canvas.width, 1/canvas.height);
     });
   }
@@ -384,11 +424,25 @@ function createCrystalEngine({canvas, wrap, getParams, onComplete, onProgress}){
     const targetProgress = clamp01(elapsed / GROWTH_DURATION_MS);
     const targetSteps = Math.floor(targetProgress * totalTarget);
     const toRun = Math.max(0, Math.min(targetSteps - stepCount, 400)); // cap per-frame batch so a slow device degrades gracefully instead of jank-freezing
-    if (toRun > 0) stepSimulation(toRun);
+    // Expected real time between successive step-target increments, at
+    // this beta's own pace -- recomputed every tick since beta (and so
+    // totalTarget) can change live while dragging the puck. This is what
+    // renderView()'s crossfade duration is timed against.
+    stepIntervalMs = GROWTH_DURATION_MS / Math.max(1, totalTarget);
+    if (toRun > 0) {
+      snapshotCurrentInto(prevRenderBuf); // capture "before" state first
+      stepSimulation(toRun);
+      lastStepAt = performance.now();
+    }
     renderView();
     if (onProgress) onProgress(targetProgress, Math.max(0, GROWTH_DURATION_MS - elapsed));
     if (targetProgress >= 1) {
       running = false;
+      // Force the crossfade fully settled on the frame that holds --
+      // without this, a completion landing mid-fade would freeze on a
+      // slightly-blended frame instead of the finished crystal.
+      lastStepAt = performance.now() - stepIntervalMs;
+      renderView();
       if (onComplete) onComplete(currentBeta, currentGamma, currentSigma);
     }
   }
