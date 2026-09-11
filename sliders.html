@@ -211,12 +211,21 @@ const engine = createCrystalEngine({
   },
 });
 
+// Playback speed is now purely a display parameter, decoupled from the
+// actual simulation step count -- growWithHeadStart computes the whole
+// crystal first, so "faster" just means replaying the same recording over
+// a shorter window, not changing anything about the physics. Halved from
+// engine.js's GROWTH_DURATION_MS default per a live report that growth
+// still felt slow after the headstart/replay change landed.
+const PLAYBACK_DURATION_MS = GROWTH_DURATION_MS / 2;
+
 function startGrowth(){
   label.classList.remove('show');
   progressTrack.classList.remove('done');
   progressFill.style.width = "0%";
   setLocked(true, "Forming…");
   engine.growWithHeadStart({
+    playbackMs: PLAYBACK_DURATION_MS,
     onComputeStart: () => { formingMsg.classList.add('show'); },
     onComputeDone: () => { formingMsg.classList.remove('show'); setLocked(true, "Growing…"); },
   });
