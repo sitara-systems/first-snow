@@ -26,6 +26,13 @@
     color: #7f95ad; opacity: 0; transition: opacity 1.2s ease;
   }
   #label.show { opacity: 1; }
+  #formingMsg {
+    height: 2.6em; display: flex; align-items: center; justify-content: center;
+    font-size: 0.95em; letter-spacing: 0.1em; text-transform: uppercase;
+    color: #5c6d82; opacity: 0; transition: opacity 0.6s ease;
+  }
+  #formingMsg.show { animation: formingPulse 1.8s ease-in-out infinite; }
+  @keyframes formingPulse { 0%, 100% { opacity: 0.45; } 50% { opacity: 1; } }
   #progressTrack {
     width: min(70vw, 420px); height: 3px; border-radius: 999px;
     background: rgba(255,255,255,0.08); margin-bottom: 22px; overflow: hidden;
@@ -95,6 +102,7 @@
 <div id="stage">
   <div id="crystalWrap"><canvas id="crystalCanvas"></canvas></div>
   <div id="label"></div>
+  <div id="formingMsg">Your crystal is forming</div>
   <div id="progressTrack"><div id="progressFill"></div></div>
   <div id="panel">
     <div class="slider-row">
@@ -164,6 +172,7 @@ function sliderParams(){
 
 // ---- engine wiring
 const label = document.getElementById('label');
+const formingMsg = document.getElementById('formingMsg');
 const progressTrack = document.getElementById('progressTrack');
 const progressFill = document.getElementById('progressFill');
 const startBtn = document.getElementById('startBtn');
@@ -174,19 +183,25 @@ const sliderIds = ['sliderBranch','sliderDensity','sliderAsym'];
 // model (where changing the input mid-growth is the whole point). Locking
 // prevents a half-finished crystal from silently having its target
 // morphology swapped out from under it while a visitor's hand is still on
-// the slider -- with a fixed GROWTH_DURATION_MS shared by every crystal
-// (see engine.js), what's on screen when Start was pressed is what the
-// full 30 seconds is committed to.
-function setLocked(locked){
+// the slider.
+function setLocked(locked, buttonText){
   for (const id of sliderIds) document.getElementById(id).disabled = locked;
   startBtn.disabled = locked;
-  startBtn.textContent = locked ? "Growing…" : "Start";
+  startBtn.textContent = buttonText || (locked ? "Growing…" : "Start");
 }
 
+// PLAN.md's twelfth 2026-09-11 finding: rather than simulate live and pace
+// it to a fixed real-time window (which is what made the fern/dendrite end
+// choppy -- its small step budget spread thin across the same window as
+// every other crystal), compute the whole thing as fast as the device
+// allows first, then replay a fixed-density recording of it smoothly.
+// Since sliders.html already locks parameters at Start with no live
+// mid-growth interaction to preserve, this loses nothing this page had.
 const engine = createCrystalEngine({
   canvas: document.getElementById('crystalCanvas'),
   wrap: document.getElementById('crystalWrap'),
   getParams: sliderParams,
+  autoStart: false, // every crystal here, including the first, goes through growWithHeadStart below
   onProgress: (frac) => { progressFill.style.width = (frac*100).toFixed(1) + "%"; },
   onComplete: (beta) => {
     label.textContent = morphologyLabel(beta);
@@ -200,18 +215,19 @@ function startGrowth(){
   label.classList.remove('show');
   progressTrack.classList.remove('done');
   progressFill.style.width = "0%";
-  setLocked(true);
-  engine.reset();
+  setLocked(true, "Forming…");
+  engine.growWithHeadStart({
+    onComputeStart: () => { formingMsg.classList.add('show'); },
+    onComputeDone: () => { formingMsg.classList.remove('show'); setLocked(true, "Growing…"); },
+  });
 }
 
 startBtn.addEventListener('click', startGrowth);
 window.addEventListener('resize', () => engine.resize());
 
-// createCrystalEngine grows once immediately on boot (same as the puck),
-// so the very first crystal is already underway before a visitor touches
-// anything -- lock from the start to match, rather than leaving sliders
-// briefly interactive over a crystal that ignores them.
-setLocked(true);
+// Grow the first crystal immediately on boot too (autoStart:false above
+// means the engine itself won't), so the page never sits showing nothing.
+startGrowth();
 </script>
 </body>
 </html>

@@ -240,7 +240,7 @@ function targetStepsFor(beta){
 // updates less often for shapes that mature faster.
 const GROWTH_DURATION_MS = 30000;
 
-function createCrystalEngine({canvas, wrap, getParams, onComplete, onProgress}){
+function createCrystalEngine({canvas, wrap, getParams, onComplete, onProgress, autoStart = true}){
   const gl = canvas.getContext('webgl2');
   gl.getExtension('EXT_color_buffer_float');
 
@@ -306,6 +306,7 @@ function createCrystalEngine({canvas, wrap, getParams, onComplete, onProgress}){
   }
 
   let bufs, cur, stepCount, seed, running, startTime, currentGamma, currentBeta, currentSigma;
+  let mode = 'live'; // 'live' (puck-style, paced real-time simulation) or 'playback' (see growWithHeadStart)
 
   function resizeCanvas(){
     // Square canvas: the reference's own final thumbnails are always
@@ -345,14 +346,22 @@ function createCrystalEngine({canvas, wrap, getParams, onComplete, onProgress}){
   // shader pass) immediately before each batch of new steps runs, so it
   // always holds "the state as it looked before this frame's advance."
   let prevRenderBuf, lastStepAt, stepIntervalMs;
+  let keyframes = null; // captured recording from growWithHeadStart, or null in 'live' mode
+  let playbackStartTime, playbackDurationMs;
   function snapshotCurrentInto(destBuf){
     gl.bindFramebuffer(gl.READ_FRAMEBUFFER, bufs[cur].fbo);
     gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, destBuf.fbo);
     gl.blitFramebuffer(0,0,SIZE,SIZE, 0,0,SIZE,SIZE, gl.COLOR_BUFFER_BIT, gl.NEAREST);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   }
+  function freeKeyframes(){
+    if (keyframes) { for (const kf of keyframes) { gl.deleteTexture(kf.tex); gl.deleteFramebuffer(kf.fbo); } }
+    keyframes = null;
+  }
 
   function resetCrystal(){
+    mode = 'live';
+    freeKeyframes();
     if (bufs) { gl.deleteTexture(bufs[0].tex); gl.deleteTexture(bufs[1].tex);
                 gl.deleteFramebuffer(bufs[0].fbo); gl.deleteFramebuffer(bufs[1].fbo); }
     if (prevRenderBuf) { gl.deleteTexture(prevRenderBuf.tex); gl.deleteFramebuffer(prevRenderBuf.fbo); }
@@ -403,11 +412,10 @@ function createCrystalEngine({canvas, wrap, getParams, onComplete, onProgress}){
     stepCount += n;
   }
 
-  function renderView(){
-    const alpha = stepIntervalMs > 0 ? clamp01((performance.now() - lastStepAt) / stepIntervalMs) : 1;
+  function renderPair(curBuf, prevBuf, alpha){
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, bufs[cur].tex);
-    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, prevRenderBuf.tex);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, curBuf.tex);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, prevBuf.tex);
     drawQuad(piView, canvas.width, canvas.height, u=>{
       gl.uniform1i(u.uState,0);
       gl.uniform1i(u.uStatePrev,1);
@@ -415,9 +423,12 @@ function createCrystalEngine({canvas, wrap, getParams, onComplete, onProgress}){
       gl.uniform2f(u.uPixel, 1/canvas.width, 1/canvas.height);
     });
   }
+  function renderView(){
+    const alpha = stepIntervalMs > 0 ? clamp01((performance.now() - lastStepAt) / stepIntervalMs) : 1;
+    renderPair(bufs[cur], prevRenderBuf, alpha);
+  }
 
-  function tick(){
-    if (!running) return;
+  function tickLive(){
     const peek = readParams();
     const totalTarget = targetStepsFor(peek.beta);
     const elapsed = performance.now() - startTime;
@@ -446,16 +457,150 @@ function createCrystalEngine({canvas, wrap, getParams, onComplete, onProgress}){
       if (onComplete) onComplete(currentBeta, currentGamma, currentSigma);
     }
   }
+
+  // Playback of a `growWithHeadStart` recording: no simulation happens
+  // here at all, just crossfading between two adjacent pre-captured
+  // keyframes at a position determined by elapsed wall-clock time against
+  // a *chosen* playback duration -- completely decoupled from how many
+  // real automaton steps the recording took to compute, which is exactly
+  // what makes this smooth across the whole beta range (a Fern's sparse
+  // ~1,050-step budget and a Simple Plate's ~70,800-step one both play
+  // back as the same number of evenly-spaced keyframes). See PLAN.md's
+  // twelfth 2026-09-11 finding.
+  function tickPlayback(){
+    const elapsed = performance.now() - playbackStartTime;
+    const t = clamp01(elapsed / playbackDurationMs);
+    const n = keyframes.length;
+    const pos = t * (n - 1);
+    const i0 = Math.floor(pos);
+    const i1 = Math.min(n - 1, i0 + 1);
+    renderPair(keyframes[i1], keyframes[i0], pos - i0);
+    if (onProgress) onProgress(t, Math.max(0, playbackDurationMs - elapsed));
+    if (t >= 1) {
+      running = false;
+      renderPair(keyframes[n-1], keyframes[n-1], 1); // settle fully on the last real frame
+      if (onComplete) onComplete(currentBeta, currentGamma, currentSigma);
+    }
+  }
+
+  function tick(){
+    if (!running) return;
+    if (mode === 'playback') tickPlayback(); else tickLive();
+  }
   function frame(){ requestAnimationFrame(frame); tick(); }
 
+  // Compute an entire crystal's growth as fast as the device allows (not
+  // paced to any real-time duration), capturing a fixed number of
+  // evenly-spaced keyframes along the way, then hand off to tickPlayback()
+  // to replay that recording smoothly over `playbackMs`. Meant for a
+  // locked-parameter interaction (sliders.html's Start button) where
+  // nothing needs to respond live while it grows -- see PLAN.md's twelfth
+  // 2026-09-11 finding for why this fixes choppiness project-wide instead
+  // of just at the fast end (the fifth/eleventh findings' fixes) and
+  // meaningfully de-risks the still-unmeasured tablet GPU (flag 11): the
+  // compute phase just needs to finish inside `onComputeStart`'s "forming"
+  // window, however long that takes on the actual device, and the visible
+  // playback is smooth regardless.
+  //
+  // Every recording is a genuine simulation run for the exact requested
+  // (gamma, beta, sigma), computed on demand with a fresh random seed --
+  // nothing is precomputed ahead of time or reused between visitors, so
+  // hard rule 1 and per-visitor uniqueness both hold exactly as they do in
+  // 'live' mode, just not synchronously with the visible animation.
+  function growWithHeadStart({numKeyframes = 120, playbackMs = GROWTH_DURATION_MS, chunkSteps = 2000, onComputeStart, onComputeProgress, onComputeDone} = {}){
+    running = false;
+    mode = 'headstart';
+    freeKeyframes();
+    const params = readParams();
+    currentGamma = params.gamma; currentBeta = params.beta; currentSigma = params.sigma;
+    if (bufs) { gl.deleteTexture(bufs[0].tex); gl.deleteTexture(bufs[1].tex);
+                gl.deleteFramebuffer(bufs[0].fbo); gl.deleteFramebuffer(bufs[1].fbo); }
+    bufs = [makeState(SIZE), makeState(SIZE)];
+    cur = 0;
+    gl.bindTexture(gl.TEXTURE_2D, bufs[0].tex);
+    gl.texSubImage2D(gl.TEXTURE_2D,0,0,0,SIZE,SIZE,gl.RGBA,gl.FLOAT, initialData(SIZE, params.gamma));
+    stepCount = 0;
+    seed = Date.now() % 100000;
+
+    const totalTarget = targetStepsFor(params.beta);
+    const kfInterval = Math.max(1, Math.round(totalTarget / numKeyframes));
+    keyframes = [];
+    function captureKeyframe(){ const kf = makeState(SIZE); snapshotCurrentInto(kf); keyframes.push(kf); }
+    captureKeyframe(); // the seed itself, so playback starts from a single point like 'live' mode does
+
+    // Fixed-params step function -- stepSimulation() intentionally re-reads
+    // getParams() every call for 'live' mode's puck-dragging responsiveness;
+    // this headless compute is for an already-locked interaction and must
+    // not depend on getParams() staying meaningful across an async,
+    // setTimeout-chunked loop.
+    const texel = [1/SIZE, 1/SIZE];
+    function stepFixed(n){
+      for (let i=0;i<n;i++){
+        const srcBuf = bufs[cur], tmpBuf = bufs[1-cur];
+        gl.bindFramebuffer(gl.FRAMEBUFFER, tmpBuf.fbo);
+        gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, srcBuf.tex);
+        drawQuad(piDiffuse, SIZE, SIZE, u=>{
+          gl.uniform1i(u.uState,0);
+          gl.uniform2fv(u.uTexel,texel);
+        });
+        gl.bindFramebuffer(gl.FRAMEBUFFER, srcBuf.fbo);
+        gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tmpBuf.tex);
+        drawQuad(piUpdate, SIZE, SIZE, u=>{
+          gl.uniform1i(u.uState,0);
+          gl.uniform2fv(u.uTexel,texel);
+          gl.uniform1f(u.uBeta, params.beta);
+          gl.uniform1f(u.uTheta, BASE.theta);
+          gl.uniform1f(u.uAlpha, BASE.alpha);
+          gl.uniform1f(u.uKappa, BASE.kappa);
+          gl.uniform1f(u.uMu, BASE.mu);
+          gl.uniform1f(u.uUpsilon, BASE.upsilon);
+          gl.uniform1f(u.uSigma, params.sigma);
+          gl.uniform1f(u.uStep, stepCount+i);
+          gl.uniform1f(u.uSeed, seed);
+        });
+      }
+      stepCount += n;
+    }
+
+    if (onComputeStart) onComputeStart();
+
+    return new Promise(resolve => {
+      function computeChunk(){
+        const thisChunk = Math.min(chunkSteps, totalTarget - stepCount);
+        let ran = 0;
+        while (ran < thisChunk) {
+          const toNextKf = kfInterval - (stepCount % kfInterval);
+          const sub = Math.min(thisChunk - ran, toNextKf);
+          stepFixed(sub);
+          ran += sub;
+          if (stepCount % kfInterval === 0 || stepCount >= totalTarget) captureKeyframe();
+        }
+        if (onComputeProgress) onComputeProgress(clamp01(stepCount / totalTarget));
+        if (stepCount < totalTarget) {
+          setTimeout(computeChunk, 0); // yield between chunks so the tab/UI stays responsive
+        } else {
+          if (keyframes.length < 2) captureKeyframe(); // guard against a degenerate tiny step budget
+          mode = 'playback';
+          playbackStartTime = performance.now();
+          playbackDurationMs = playbackMs;
+          running = true; // the existing frame()/rAF loop now drives tickPlayback()
+          if (onComputeDone) onComputeDone();
+          resolve();
+        }
+      }
+      computeChunk();
+    });
+  }
+
   resizeCanvas();
-  resetCrystal();
+  if (autoStart) resetCrystal();
   requestAnimationFrame(frame);
 
   return {
     reset: resetCrystal,
     resize: resizeCanvas,
     isRunning: () => running,
+    growWithHeadStart,
     // Calibration/testing hook only -- lets a measurement script (see
     // PLAN.md for the BETA_STEP_TABLE methodology) drive raw simulation
     // steps and read back the sim texture directly, bypassing the
@@ -463,8 +608,11 @@ function createCrystalEngine({canvas, wrap, getParams, onComplete, onProgress}){
     _debug: {
       gl,
       fastForward(){ startTime = performance.now() - GROWTH_DURATION_MS - 1; },
+      fastForwardPlayback(){ if (playbackStartTime != null) playbackStartTime = performance.now() - playbackDurationMs - 1; },
       tick,
       stepSimulation,
+      keyframeCount: () => keyframes ? keyframes.length : 0,
+      mode: () => mode,
       readAttachedBoundingRadiusFrac(){
         const buf = bufs[cur];
         gl.bindFramebuffer(gl.FRAMEBUFFER, buf.fbo);
