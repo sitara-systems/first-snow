@@ -166,7 +166,26 @@ void main(){
 }
 `;
 
-const SIZE = 384; // see docs/performance.md: 256/512 recommended over 1024; sized up from 256 for margin headroom at the fast-growth (low beta) corner of the live puck range
+// Tried raising this to 512 (docs/performance.md's own upper end of its
+// "256 or 512, not 1024" recommendation) for finer branch detail, and
+// reverted after measuring the actual cost at high beta: step count to
+// reach 72% of the boundary does NOT scale linearly with SIZE the way
+// overflow-margin reasoning assumed. At beta=2.05 it went from 30,300
+// steps (SIZE=384) to 98,000 (SIZE=512) -- more than 3x, not the ~1.33x
+// a linear radius-vs-lattice relationship predicts. At beta=2.20, 512
+// didn't even reach 72% within 160,000 steps (was 38,400 at 384). At the
+// true beta=2.60 extreme, 512 reached only 52% of the boundary after
+// 250,000 steps (was a clean 70,800 steps to 72% at 384). Whatever is
+// happening -- some interaction between the reflecting boundary, the
+// larger domain, and the high-beta regime's already-slow kinetics -- it
+// makes high-beta growth qualitatively worse at 512, not just slower to
+// finish, and was not something the 256-vs-512-vs-1024 throughput
+// recommendation (based on raw steps/sec, not this radius-vs-steps
+// relationship) anticipated. Left at 384, the value this project's own
+// prior testing actually validated at this level of detail. See PLAN.md's
+// tenth 2026-09-11 finding -- worth understanding properly before trying
+// this again, not re-attempting on a hunch that more headroom helps.
+const SIZE = 384;
 
 // Steps needed to reach a "developed but safe" crystal (72% of the way to
 // the lattice's reflecting boundary, measured as the raw sim-texture's
@@ -278,9 +297,22 @@ function createCrystalEngine({canvas, wrap, getParams, onComplete, onProgress}){
     // square (graphics.py's save_image(resize=N) forces NxN regardless of
     // the rotated/squished intermediate image's aspect ratio).
     const side = Math.round(Math.min(wrap.clientWidth, wrap.clientHeight) * 0.92);
-    canvas.width = side; canvas.height = side;
     canvas.style.width = side + "px";
     canvas.style.height = side + "px";
+    // The canvas's backing store (canvas.width/height) is a display-only
+    // resolution -- independent of SIZE, the simulation lattice above. An
+    // earlier version left this at the CSS pixel size directly, which
+    // under-renders on a high-DPI display (a Surface Pro's screen is
+    // notably dense): the browser then upscales the WebGL output like any
+    // other undersized image, going soft exactly where a dense screen
+    // would otherwise show the 4x supersampled edges above at full
+    // sharpness. Matching devicePixelRatio costs nothing simulation-side
+    // (view shader cost scales with canvas pixel count, but that shader is
+    // cheap -- 4 texture taps -- and runs once per rendered frame, not per
+    // simulation step, unlike SIZE).
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.round(side * dpr);
+    canvas.height = Math.round(side * dpr);
   }
 
   function readParams(){
@@ -344,8 +376,7 @@ function createCrystalEngine({canvas, wrap, getParams, onComplete, onProgress}){
     });
   }
 
-  function frame(){
-    requestAnimationFrame(frame);
+  function tick(){
     if (!running) return;
     const peek = readParams();
     const totalTarget = targetStepsFor(peek.beta);
@@ -361,6 +392,7 @@ function createCrystalEngine({canvas, wrap, getParams, onComplete, onProgress}){
       if (onComplete) onComplete(currentBeta, currentGamma, currentSigma);
     }
   }
+  function frame(){ requestAnimationFrame(frame); tick(); }
 
   resizeCanvas();
   resetCrystal();
@@ -370,5 +402,31 @@ function createCrystalEngine({canvas, wrap, getParams, onComplete, onProgress}){
     reset: resetCrystal,
     resize: resizeCanvas,
     isRunning: () => running,
+    // Calibration/testing hook only -- lets a measurement script (see
+    // PLAN.md for the BETA_STEP_TABLE methodology) drive raw simulation
+    // steps and read back the sim texture directly, bypassing the
+    // time-paced frame() loop. Not used by either front end's own UI.
+    _debug: {
+      gl,
+      fastForward(){ startTime = performance.now() - GROWTH_DURATION_MS - 1; },
+      tick,
+      stepSimulation,
+      readAttachedBoundingRadiusFrac(){
+        const buf = bufs[cur];
+        gl.bindFramebuffer(gl.FRAMEBUFFER, buf.fbo);
+        const px = new Float32Array(SIZE*SIZE*4);
+        gl.readPixels(0,0,SIZE,SIZE,gl.RGBA,gl.FLOAT,px);
+        const c = SIZE/2;
+        let maxR = 0;
+        for (let y=0;y<SIZE;y++) for (let x=0;x<SIZE;x++){
+          if (px[(y*SIZE+x)*4] > 0.5){
+            const dx=x-c, dy=y-c;
+            const r = Math.sqrt(dx*dx+dy*dy);
+            if (r>maxR) maxR = r;
+          }
+        }
+        return maxR/c;
+      },
+    },
   };
 }

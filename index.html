@@ -49,19 +49,21 @@
     border-radius: 50%; background: #e8eef7; box-shadow: 0 0 18px 4px rgba(232,238,247,0.55);
     pointer-events: none;
   }
-  #resetBtn {
-    position: fixed; top: max(2vh, 14px); right: max(2vh, 14px);
-    width: 44px; height: 44px; border-radius: 50%;
-    background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.14);
-    color: #8fa0b5; font-size: 1.3em; line-height: 44px; text-align: center;
-    -webkit-tap-highlight-color: transparent;
+  #bottomBar {
+    display: flex; align-items: center; justify-content: center; gap: 14px;
+    padding: max(2.5vh, 16px) 0;
   }
-  #resetBtn:active { background: rgba(255,255,255,0.14); }
-  #modeLink {
-    position: fixed; top: max(2vh, 14px); left: max(2vh, 14px);
-    font-size: 0.7em; letter-spacing: 0.1em; text-transform: uppercase;
-    color: #5c6d82; text-decoration: none;
+  .pillBtn {
+    padding: 11px 26px; border-radius: 999px;
+    background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.22);
+    color: #cfd8e3; font-size: 0.78em; letter-spacing: 0.12em; text-transform: uppercase;
+    text-decoration: none; -webkit-tap-highlight-color: transparent;
   }
+  .pillBtn:active { background: rgba(255,255,255,0.18); }
+  .pillBtn.primary {
+    background: rgba(232,238,247,0.16); border-color: rgba(232,238,247,0.5); color: #f2f5fa;
+  }
+  .pillBtn:disabled { opacity: 0.35; pointer-events: none; }
 </style>
 </head>
 <body>
@@ -70,9 +72,11 @@
   <div id="label"></div>
   <div id="progressTrack"><div id="progressFill"></div></div>
   <div id="puckArea"><div id="puck"></div></div>
+  <div id="bottomBar">
+    <a class="pillBtn" href="sliders.html">Sliders</a>
+    <button class="pillBtn primary" id="resetBtn">Reset</button>
+  </div>
 </div>
-<button id="resetBtn" title="Start a new crystal">&#8635;</button>
-<a id="modeLink" href="sliders.html">Sliders</a>
 
 <script src="engine.js"></script>
 <script>

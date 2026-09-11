@@ -73,19 +73,22 @@
     background: #e8eef7; box-shadow: 0 0 12px 2px rgba(232,238,247,0.5);
     border: none;
   }
-  #resetBtn {
-    position: fixed; top: max(2vh, 14px); right: max(2vh, 14px);
-    width: 44px; height: 44px; border-radius: 50%;
-    background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.14);
-    color: #8fa0b5; font-size: 1.3em; line-height: 44px; text-align: center;
-    -webkit-tap-highlight-color: transparent;
+  #bottomBar {
+    display: flex; align-items: center; justify-content: center; gap: 14px;
+    padding: max(2.5vh, 16px) 0;
   }
-  #resetBtn:active { background: rgba(255,255,255,0.14); }
-  #modeLink {
-    position: fixed; top: max(2vh, 14px); left: max(2vh, 14px);
-    font-size: 0.7em; letter-spacing: 0.1em; text-transform: uppercase;
-    color: #5c6d82; text-decoration: none;
+  .pillBtn {
+    padding: 11px 26px; border-radius: 999px;
+    background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.22);
+    color: #cfd8e3; font-size: 0.78em; letter-spacing: 0.12em; text-transform: uppercase;
+    text-decoration: none; -webkit-tap-highlight-color: transparent;
   }
+  .pillBtn:active { background: rgba(255,255,255,0.18); }
+  .pillBtn.primary {
+    background: rgba(232,238,247,0.16); border-color: rgba(232,238,247,0.5); color: #f2f5fa;
+  }
+  .pillBtn:disabled { opacity: 0.35; pointer-events: none; }
+  input[type=range]:disabled { opacity: 0.4; }
 </style>
 </head>
 <body>
@@ -110,9 +113,11 @@
       <div class="slider-caps"><span>Perfect</span><span>Wild</span></div>
     </div>
   </div>
+  <div id="bottomBar">
+    <a class="pillBtn" href="index.html">Puck</a>
+    <button class="pillBtn primary" id="startBtn">Start</button>
+  </div>
 </div>
-<button id="resetBtn" title="Start a new crystal">&#8635;</button>
-<a id="modeLink" href="index.html">Puck</a>
 
 <script src="engine.js"></script>
 <script>
@@ -161,6 +166,22 @@ function sliderParams(){
 const label = document.getElementById('label');
 const progressTrack = document.getElementById('progressTrack');
 const progressFill = document.getElementById('progressFill');
+const startBtn = document.getElementById('startBtn');
+const sliderIds = ['sliderBranch','sliderDensity','sliderAsym'];
+
+// A live report asked for sliders that freeze while a crystal is growing,
+// with an explicit Start button rather than the puck's continuous-drag
+// model (where changing the input mid-growth is the whole point). Locking
+// prevents a half-finished crystal from silently having its target
+// morphology swapped out from under it while a visitor's hand is still on
+// the slider -- with a fixed GROWTH_DURATION_MS shared by every crystal
+// (see engine.js), what's on screen when Start was pressed is what the
+// full 30 seconds is committed to.
+function setLocked(locked){
+  for (const id of sliderIds) document.getElementById(id).disabled = locked;
+  startBtn.disabled = locked;
+  startBtn.textContent = locked ? "Growing…" : "Start";
+}
 
 const engine = createCrystalEngine({
   canvas: document.getElementById('crystalCanvas'),
@@ -171,28 +192,26 @@ const engine = createCrystalEngine({
     label.textContent = morphologyLabel(beta);
     label.classList.add('show');
     progressTrack.classList.add('done');
+    setLocked(false);
   },
 });
 
-function resetCrystal(){
+function startGrowth(){
   label.classList.remove('show');
   progressTrack.classList.remove('done');
   progressFill.style.width = "0%";
+  setLocked(true);
   engine.reset();
 }
 
-document.getElementById('resetBtn').addEventListener('click', resetCrystal);
+startBtn.addEventListener('click', startGrowth);
 window.addEventListener('resize', () => engine.resize());
 
-// Moving a slider mid-growth changes future steps immediately (getParams
-// is read fresh every simulation step, same as the puck) -- no extra
-// wiring needed for live response, but a fresh crystal on every slider
-// release feels more intentional for a "design your own" tool than
-// continuously reshaping one in flight, so each slider restarts growth on
-// release rather than only on the explicit reset button.
-for (const id of ['sliderBranch','sliderDensity','sliderAsym']) {
-  document.getElementById(id).addEventListener('change', resetCrystal);
-}
+// createCrystalEngine grows once immediately on boot (same as the puck),
+// so the very first crystal is already underway before a visitor touches
+// anything -- lock from the start to match, rather than leaving sliders
+// briefly interactive over a crystal that ignores them.
+setLocked(true);
 </script>
 </body>
 </html>
