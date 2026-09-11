@@ -1,0 +1,145 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>First Snow</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden;
+    background: #05070a; color: #cfd8e3; font-family: -apple-system, "Segoe UI", sans-serif;
+    touch-action: none; -webkit-user-select: none; user-select: none;
+  }
+  #stage {
+    position: fixed; inset: 0;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+  }
+  #crystalWrap {
+    flex: 1 1 auto; width: 100%;
+    display: flex; align-items: center; justify-content: center;
+    min-height: 0;
+  }
+  #crystalCanvas { background: #05070a; max-width: 92vw; max-height: 100%; }
+  #label {
+    height: 2.6em; display: flex; align-items: center; justify-content: center;
+    font-size: 1.1em; letter-spacing: 0.14em; text-transform: uppercase;
+    color: #7f95ad; opacity: 0; transition: opacity 1.2s ease;
+  }
+  #label.show { opacity: 1; }
+  #progressTrack {
+    width: min(46vw, 46vh); height: 3px; border-radius: 999px;
+    background: rgba(255,255,255,0.08); margin-bottom: 14px; overflow: hidden;
+  }
+  #progressFill {
+    height: 100%; width: 0%; background: #6f88a8; border-radius: 999px;
+    transition: opacity 0.4s ease; transform-origin: left;
+  }
+  #progressTrack.done #progressFill { opacity: 0; }
+  #puckArea {
+    position: relative; width: min(46vw, 46vh); height: min(46vw, 46vh);
+    margin-bottom: max(3vh, 12px);
+    border-radius: 999px;
+    background: radial-gradient(circle at 30% 75%, rgba(120,170,255,0.10), transparent 60%),
+                radial-gradient(circle at 70% 25%, rgba(255,210,150,0.08), transparent 60%),
+                #0b0f16;
+    border: 1px solid #1c2531;
+  }
+  #puck {
+    position: absolute; width: 34px; height: 34px; margin: -17px 0 0 -17px;
+    border-radius: 50%; background: #e8eef7; box-shadow: 0 0 18px 4px rgba(232,238,247,0.55);
+    pointer-events: none;
+  }
+  #resetBtn {
+    position: fixed; top: max(2vh, 14px); right: max(2vh, 14px);
+    width: 44px; height: 44px; border-radius: 50%;
+    background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.14);
+    color: #8fa0b5; font-size: 1.3em; line-height: 44px; text-align: center;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #resetBtn:active { background: rgba(255,255,255,0.14); }
+  #modeLink {
+    position: fixed; top: max(2vh, 14px); left: max(2vh, 14px);
+    font-size: 0.7em; letter-spacing: 0.1em; text-transform: uppercase;
+    color: #5c6d82; text-decoration: none;
+  }
+</style>
+</head>
+<body>
+<div id="stage">
+  <div id="crystalWrap"><canvas id="crystalCanvas"></canvas></div>
+  <div id="label"></div>
+  <div id="progressTrack"><div id="progressFill"></div></div>
+  <div id="puckArea"><div id="puck"></div></div>
+</div>
+<button id="resetBtn" title="Start a new crystal">&#8635;</button>
+<a id="modeLink" href="sliders.html">Sliders</a>
+
+<script src="engine.js"></script>
+<script>
+// ---- Puck interaction
+const puckArea = document.getElementById('puckArea');
+const puckEl = document.getElementById('puck');
+// puckFrac is the single source of truth for the puck's logical position
+// (0..1 in both axes), independent of any one layout snapshot -- an
+// earlier version stored the puck's position in absolute pixels captured
+// once at boot, which could go stale if the container's CSS min(46vw,46vh)
+// sizing hadn't settled yet (a real observed race -- see PLAN.md's fourth
+// 2026-09-11 finding). x defaults to 0.4 rather than 0.5: with engine.js's
+// power-curve beta remap, x=0.5 sits almost exactly on the fern/dendrite-
+// vs-plate boundary, so an untouched puck could still open on a plate.
+let puckFrac = {x: 0.4, y: 0.62};
+
+function placePuckVisually(){
+  const rect = puckArea.getBoundingClientRect();
+  puckEl.style.left = (puckFrac.x * rect.width) + "px";
+  puckEl.style.top = (puckFrac.y * rect.height) + "px";
+}
+
+function setPuckFromEvent(clientX, clientY){
+  const rect = puckArea.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return; // not laid out yet -- ignore rather than divide by zero
+  let x = clientX - rect.left, y = clientY - rect.top;
+  x = Math.max(0, Math.min(rect.width, x));
+  y = Math.max(0, Math.min(rect.height, y));
+  puckFrac = {x: x / rect.width, y: y / rect.height};
+  placePuckVisually();
+}
+
+let dragging = false;
+puckArea.addEventListener('pointerdown', e => { dragging = true; setPuckFromEvent(e.clientX, e.clientY); puckArea.setPointerCapture(e.pointerId); });
+puckArea.addEventListener('pointermove', e => { if (dragging) setPuckFromEvent(e.clientX, e.clientY); });
+puckArea.addEventListener('pointerup', () => { dragging = false; });
+puckArea.addEventListener('pointercancel', () => { dragging = false; });
+
+// ---- engine wiring
+const label = document.getElementById('label');
+const progressTrack = document.getElementById('progressTrack');
+const progressFill = document.getElementById('progressFill');
+
+const engine = createCrystalEngine({
+  canvas: document.getElementById('crystalCanvas'),
+  wrap: document.getElementById('crystalWrap'),
+  getParams: () => puckToParams(puckFrac.x, puckFrac.y),
+  onProgress: (frac) => { progressFill.style.width = (frac*100).toFixed(1) + "%"; },
+  onComplete: (beta) => {
+    label.textContent = morphologyLabel(beta);
+    label.classList.add('show');
+    progressTrack.classList.add('done');
+  },
+});
+
+function resetCrystal(){
+  label.classList.remove('show');
+  progressTrack.classList.remove('done');
+  progressFill.style.width = "0%";
+  engine.reset();
+}
+
+document.getElementById('resetBtn').addEventListener('click', resetCrystal);
+window.addEventListener('resize', () => { engine.resize(); placePuckVisually(); });
+
+// ---- boot
+placePuckVisually();
+</script>
+</body>
+</html>

@@ -1,0 +1,198 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>First Snow — Sliders</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden;
+    background: #05070a; color: #cfd8e3; font-family: -apple-system, "Segoe UI", sans-serif;
+    touch-action: none; -webkit-user-select: none; user-select: none;
+  }
+  #stage {
+    position: fixed; inset: 0;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+  }
+  #crystalWrap {
+    flex: 1 1 auto; width: 100%;
+    display: flex; align-items: center; justify-content: center;
+    min-height: 0;
+  }
+  #crystalCanvas { background: #05070a; max-width: 92vw; max-height: 100%; }
+  #label {
+    height: 2.6em; display: flex; align-items: center; justify-content: center;
+    font-size: 1.1em; letter-spacing: 0.14em; text-transform: uppercase;
+    color: #7f95ad; opacity: 0; transition: opacity 1.2s ease;
+  }
+  #label.show { opacity: 1; }
+  #progressTrack {
+    width: min(70vw, 420px); height: 3px; border-radius: 999px;
+    background: rgba(255,255,255,0.08); margin-bottom: 22px; overflow: hidden;
+  }
+  #progressFill {
+    height: 100%; width: 0%; background: #6f88a8; border-radius: 999px;
+    transition: opacity 0.4s ease;
+  }
+  #progressTrack.done #progressFill { opacity: 0; }
+  #panel {
+    width: min(70vw, 420px);
+    display: flex; flex-direction: column; gap: 18px;
+    margin-bottom: max(3vh, 16px);
+  }
+  .slider-row { display: flex; flex-direction: column; gap: 6px; }
+  .slider-caps {
+    display: flex; justify-content: space-between;
+    font-size: 0.72em; letter-spacing: 0.08em; text-transform: uppercase;
+    color: #5c6d82;
+  }
+  .slider-name {
+    font-size: 0.82em; letter-spacing: 0.1em; text-transform: uppercase;
+    color: #8fa0b5; text-align: center;
+  }
+  input[type=range] {
+    -webkit-appearance: none; appearance: none;
+    width: 100%; height: 28px; background: transparent; touch-action: pan-y;
+  }
+  input[type=range]::-webkit-slider-runnable-track {
+    height: 3px; border-radius: 999px;
+    background: linear-gradient(90deg, rgba(120,170,255,0.35), rgba(255,210,150,0.35));
+  }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none;
+    width: 22px; height: 22px; margin-top: -9.5px; border-radius: 50%;
+    background: #e8eef7; box-shadow: 0 0 12px 2px rgba(232,238,247,0.5);
+    border: none;
+  }
+  input[type=range]::-moz-range-track {
+    height: 3px; border-radius: 999px;
+    background: linear-gradient(90deg, rgba(120,170,255,0.35), rgba(255,210,150,0.35));
+  }
+  input[type=range]::-moz-range-thumb {
+    width: 22px; height: 22px; border-radius: 50%;
+    background: #e8eef7; box-shadow: 0 0 12px 2px rgba(232,238,247,0.5);
+    border: none;
+  }
+  #resetBtn {
+    position: fixed; top: max(2vh, 14px); right: max(2vh, 14px);
+    width: 44px; height: 44px; border-radius: 50%;
+    background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.14);
+    color: #8fa0b5; font-size: 1.3em; line-height: 44px; text-align: center;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #resetBtn:active { background: rgba(255,255,255,0.14); }
+  #modeLink {
+    position: fixed; top: max(2vh, 14px); left: max(2vh, 14px);
+    font-size: 0.7em; letter-spacing: 0.1em; text-transform: uppercase;
+    color: #5c6d82; text-decoration: none;
+  }
+</style>
+</head>
+<body>
+<div id="stage">
+  <div id="crystalWrap"><canvas id="crystalCanvas"></canvas></div>
+  <div id="label"></div>
+  <div id="progressTrack"><div id="progressFill"></div></div>
+  <div id="panel">
+    <div class="slider-row">
+      <div class="slider-name">Branchiness</div>
+      <input type="range" id="sliderBranch" min="0" max="100" value="55">
+      <div class="slider-caps"><span>Smooth Plate</span><span>Feathery Fern</span></div>
+    </div>
+    <div class="slider-row">
+      <div class="slider-name">Density</div>
+      <input type="range" id="sliderDensity" min="0" max="100" value="50">
+      <div class="slider-caps"><span>Delicate</span><span>Lush</span></div>
+    </div>
+    <div class="slider-row">
+      <div class="slider-name">Asymmetry</div>
+      <input type="range" id="sliderAsym" min="0" max="100" value="20">
+      <div class="slider-caps"><span>Perfect</span><span>Wild</span></div>
+    </div>
+  </div>
+</div>
+<button id="resetBtn" title="Start a new crystal">&#8635;</button>
+<a id="modeLink" href="index.html">Puck</a>
+
+<script src="engine.js"></script>
+<script>
+// ---- Naming the 2D (well, 3D once asymmetry is included) parameter space
+// for a visitor who doesn't need to know what gamma/beta/sigma mean. See
+// PLAN.md for the full reasoning; short version:
+//
+// - Branchiness -> beta (attachment anisotropy). This is the single axis
+//   that actually drives which of the four morphology families appears
+//   (Fern through Simple Plate), so it gets to be the headline slider.
+//   Reuses the SAME power-curve remap as the puck (BETA_CURVE_POWER) for
+//   the same reason: the "smooth plate" two-thirds of the raw beta range
+//   looks nearly identical regardless of exact position, so a linear
+//   slider would make "Branchiness" feel unresponsive across most of its
+//   own range. Inverted from the puck's px (branchiness=1 means beta is
+//   LOW, i.e. Fern) so the slider's plain-language direction (more
+//   branchiness = more branches) matches what it visibly does.
+// - Density -> gamma (supersaturation/vapor density). At a fixed
+//   Branchiness, this is what Phase 2 found supersaturation actually
+//   modulates: overall scale and how richly filled-in the branches look,
+//   not which family appears. Linear is fine here -- gamma's live range
+//   is narrow (GAMMA_RANGE) and Phase 2/demo testing didn't find a
+//   similar "looks the same across two-thirds of the range" problem.
+// - Asymmetry -> sigma (the model's per-cell noise term). Not exposed on
+//   the puck at all (fixed at DEFAULT_SIGMA there). A third slider is a
+//   free addition once sliders replace a 2D drag surface, and this is the
+//   one remaining knob Phase 3 already characterized as safe to vary
+//   (sigma=0 vs sigma=0.0008, both tested, same crystal family, only the
+//   arms' equality changes) -- see docs/performance.md's symmetry
+//   comparison. Kept inside that tested neighborhood (0 to 0.0015)
+//   deliberately, not extrapolated further.
+const BRANCH_RANGE_POWER = BETA_CURVE_POWER; // same curve as the puck, see comment above
+const ASYMMETRY_RANGE = [0.0, 0.0015];
+
+function sliderParams(){
+  const branch = document.getElementById('sliderBranch').value / 100; // 0..1, 1 = most branchy
+  const density = document.getElementById('sliderDensity').value / 100; // 0..1
+  const asym = document.getElementById('sliderAsym').value / 100; // 0..1
+  const beta = BETA_RANGE[0] + (BETA_RANGE[1]-BETA_RANGE[0]) * Math.pow(1 - branch, BRANCH_RANGE_POWER);
+  const gamma = lerp(GAMMA_RANGE[0], GAMMA_RANGE[1], density);
+  const sigma = lerp(ASYMMETRY_RANGE[0], ASYMMETRY_RANGE[1], asym);
+  return {gamma, beta, sigma};
+}
+
+// ---- engine wiring
+const label = document.getElementById('label');
+const progressTrack = document.getElementById('progressTrack');
+const progressFill = document.getElementById('progressFill');
+
+const engine = createCrystalEngine({
+  canvas: document.getElementById('crystalCanvas'),
+  wrap: document.getElementById('crystalWrap'),
+  getParams: sliderParams,
+  onProgress: (frac) => { progressFill.style.width = (frac*100).toFixed(1) + "%"; },
+  onComplete: (beta) => {
+    label.textContent = morphologyLabel(beta);
+    label.classList.add('show');
+    progressTrack.classList.add('done');
+  },
+});
+
+function resetCrystal(){
+  label.classList.remove('show');
+  progressTrack.classList.remove('done');
+  progressFill.style.width = "0%";
+  engine.reset();
+}
+
+document.getElementById('resetBtn').addEventListener('click', resetCrystal);
+window.addEventListener('resize', () => engine.resize());
+
+// Moving a slider mid-growth changes future steps immediately (getParams
+// is read fresh every simulation step, same as the puck) -- no extra
+// wiring needed for live response, but a fresh crystal on every slider
+// release feels more intentional for a "design your own" tool than
+// continuously reshaping one in flight, so each slider restarts growth on
+// release rather than only on the explicit reset button.
+for (const id of ['sliderBranch','sliderDensity','sliderAsym']) {
+  document.getElementById(id).addEventListener('change', resetCrystal);
+}
+</script>
+</body>
+</html>
