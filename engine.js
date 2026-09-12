@@ -408,6 +408,61 @@ function createCrystalEngine({canvas, wrap, getParams, onComplete, onProgress, a
     keyframes = null;
   }
 
+  // Diffusion-limited growth spends long stretches of its step budget with
+  // almost nothing visibly happening (vapor still diffusing, no new
+  // attachment) between bursts where a tip actually advances -- a live
+  // report described this as the animation seeming to "freeze" even though
+  // it's still running. Evenly-spaced-by-step keyframes (below) capture
+  // those static stretches just as densely as the active ones, so playback
+  // (which spends equal wall-clock time per keyframe pair) wastes real time
+  // sitting on frames that look identical. Fixing this at the source (i.e.
+  // spacing keyframes by simulated time instead of step count) doesn't work
+  // because "step count" *is* this model's only time axis. Instead: capture
+  // as before, then drop any keyframe whose attached-cell count didn't
+  // change (within noise) since the last *kept* keyframe. tickPlayback()
+  // already spends equal wall-clock time per keyframe *index*, so removing
+  // near-duplicate frames from the list automatically reallocates their
+  // share of playbackMs to the frames that actually show change -- no
+  // change needed there.
+  //
+  // The signature is an exact attached-cell count (full-resolution
+  // readback of each keyframe's attached channel). A first attempt tried
+  // reading back a small NEAREST-downsampled copy instead to keep the
+  // per-frame cost down, but NEAREST-sampling a 16x-smaller grid mostly
+  // just misses the 1-2px-wide dendrite arms entirely -- it collapsed
+  // nearly the whole recording down to 2 keyframes (first+last) because
+  // almost no downsample sample ever landed on an attached cell. Attached
+  // count only ever increases (see FS_UPDATE_SRC: once a cell's a>0.5 it
+  // short-circuits to itself forever), so an exact integer count is also a
+  // simpler test than a fuzzy epsilon: drop a keyframe iff its count is
+  // identical to the last *kept* keyframe's.
+  const actPixels = new Float32Array(SIZE*SIZE*4);
+  function attachedCountOf(kf){
+    gl.bindFramebuffer(gl.FRAMEBUFFER, kf.fbo);
+    gl.readPixels(0,0,SIZE,SIZE,gl.RGBA,gl.FLOAT,actPixels);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    let attached = 0;
+    for (let i=0;i<SIZE*SIZE;i++) if (actPixels[i*4] > 0.5) attached++;
+    return attached;
+  }
+  function dropStaticKeyframes(){
+    if (keyframes.length <= 2) return; // nothing to collapse
+    const kept = [keyframes[0]];
+    let lastCount = attachedCountOf(keyframes[0]);
+    for (let i=1;i<keyframes.length-1;i++){
+      const count = attachedCountOf(keyframes[i]);
+      if (count !== lastCount) {
+        kept.push(keyframes[i]);
+        lastCount = count;
+      } else {
+        gl.deleteTexture(keyframes[i].tex);
+        gl.deleteFramebuffer(keyframes[i].fbo);
+      }
+    }
+    kept.push(keyframes[keyframes.length-1]); // always keep the final, fully-grown frame
+    keyframes = kept;
+  }
+
   function resetCrystal(){
     mode = 'live';
     freeKeyframes();
@@ -652,6 +707,7 @@ function createCrystalEngine({canvas, wrap, getParams, onComplete, onProgress, a
           setTimeout(computeChunk, 0); // yield between chunks so the tab/UI stays responsive
         } else {
           if (keyframes.length < 2) captureKeyframe(); // guard against a degenerate tiny step budget
+          dropStaticKeyframes();
           mode = 'playback';
           playbackStartTime = performance.now();
           playbackDurationMs = playbackMs;
