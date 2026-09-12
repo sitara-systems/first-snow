@@ -16,7 +16,17 @@
 // finishes; it should return the label text to show (see `morphologyLabel`
 // below for the puck's mapping, or supply a different one).
 
-const GAMMA_RANGE = [0.40, 0.55];
+// Floor raised from 0.40 to 0.48 (2026-09-12): below ~0.48, reaching
+// TARGET_RADIUS_FRAC needs so many more steps than BETA_STEP_TABLE
+// assumes (measured up to ~230,000-240,000 steps at the old floor, vs.
+// ~94,000 for even the slowest beta) that growWithHeadStart()'s "forming"
+// wait would run 80-100+ seconds to hold every crystal to the same final
+// size. Measured directly across the full beta range at gamma=0.48: worst
+// case (beta=1.6) needs 2.33x BETA_STEP_TABLE's estimate, comfortably
+// inside growWithHeadStart()/tickLive()'s existing 3x extension cap. See
+// PLAN.md's 2026-09-12 findings (same-final-size fix, then this range
+// narrowing).
+const GAMMA_RANGE = [0.48, 0.55];
 const BETA_RANGE = [1.10, 2.60];
 const BASE = {alpha:0.08, theta:0.025, kappa:0.005, mu:0.06, upsilon:0.0001};
 const DEFAULT_SIGMA = 0.0006; // small, deliberate imperfection -- see docs/performance.md's symmetry comparison
