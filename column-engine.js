@@ -23,13 +23,12 @@
 // own framing), so height is tapered toward zero as beta moves into
 // branchy (fern/stellar-dendrite) territory, using the same beta bands
 // engine.js's morphologyLabel() already documents. The boundary trace
-// itself (radialBoundary, further down) is still a coarse 180-point
-// star-shaped approximation regardless of beta -- accurate for a solid
-// hexagon, a real simplification of a fern's fine sub-branch structure
-// (see PLAN.md). Tapering height to ~0 there hides most of that loss
-// (a near-flat mesh's silhouette fidelity matters less), but does not
-// eliminate it; this is a known, accepted limitation of one shared 3D
-// rendering path across the whole spectrum, not a fixed problem.
+// itself (traceBoundary, further down) is exact marching squares, not an
+// angle-sampled approximation -- it correctly resolves a fern's concave
+// notches and side-branch structure, not just a solid hexagon's outline.
+// An earlier version used a 180-ray radial march instead, which could
+// only ever be right for star-shaped, non-branching blobs; see PLAN.md's
+// 2026-09-12 entries for both that limitation and this fix.
 //
 // Kept as a separate file from engine.js on purpose: this is a spike, and
 // duplicating the ~30 lines of shader/stepping plumbing it actually needs
@@ -125,14 +124,14 @@ void main(){
 `;
 
 // Runs the 2D CA headlessly to TARGET_RADIUS_FRAC (matching engine.js's
-// same-final-size fix -- see PLAN.md), capturing a radial boundary trace
-// (NOT the full mask -- see attachedRadialBoundary below) at intervals,
-// then in a second pass assigns each captured frame a height via the
-// stall heuristic described at the top of this file.
+// same-final-size fix -- see PLAN.md), capturing a simplified marching-
+// squares boundary trace (NOT the full mask -- see traceBoundary below)
+// at intervals, then in a second pass assigns each captured frame a
+// height via the stall heuristic described at the top of this file.
 //
 // aspectRatio: total final height AT FULL hexagonCompatibility, as a
 // multiple of the crystal's own target xy radius (both in the same
-// lattice-pixel units -- see radialBoundary below) -- 0.15 reads as a
+// lattice-pixel units -- see traceBoundary below) -- 0.15 reads as a
 // squat plate, ~4 as a slender needle. The ACTUAL total height is this
 // scaled by hexagonCompatibility(beta) (see below), so a low (fern) beta
 // ends up nearly flat regardless of aspectRatio. Untuned -- see PLAN.md's
@@ -244,30 +243,153 @@ async function growColumnCrystal({beta = 2.2, gamma = 0.50, sigma = 0.0006, aspe
     }
     return Math.sqrt(maxR2)/c;
   }
-  // Radial boundary trace, in LATTICE (unsheared) space, centered on the
-  // seed. Exact for a solid hexagon; a coarse, star-shaped approximation
-  // of a fern's fine sub-branch structure (see this file's top comment).
-  // 180 rays (up from an initial 96) to give branchy shapes a somewhat
-  // better chance at resolving their 6 main arms. Cheap either way, and
-  // avoids storing a full per-frame mask (147KB) -- ~1.4KB/frame instead.
-  const NUM_RAYS = 180;
-  function radialBoundary(){
-    const c = COL_SIZE/2;
-    const pts = [];
-    for (let i=0;i<NUM_RAYS;i++){
-      const ang = (i/NUM_RAYS)*Math.PI*2;
-      const dx = Math.cos(ang), dy = Math.sin(ang);
-      let lastR = 0;
-      for (let r=0; r<c-1; r+=0.5){
-        const px = Math.round(c+dx*r), py = Math.round(c+dy*r);
-        if (pixels[(py*COL_SIZE+px)*4] > 0.5) lastR = r; else if (lastR>0) break;
+  // Exact pixel-precision boundary via marching squares, replacing an
+  // earlier 180-ray radial march that only worked for solid, star-shaped
+  // hexagons -- it silently threw away any concave detail (a fern's
+  // notches between arms, side-branch structure) *before* tracing, since
+  // it could only record one radius per angle. Marching squares finds
+  // every crossing of the binary attached/unattached field, so a
+  // dendrite's actual fingered outline comes through, not an approximate
+  // envelope of it. See this file's top comment and PLAN.md's
+  // 2026-09-12 entry.
+  //
+  // The attached region is a single connected blob with no interior
+  // holes by construction (FS_UPDATE_SRC: any cell with >=4 attached
+  // neighbors always attaches on its very next step, so a fully-enclosed
+  // unattached pocket can't persist to the frames this captures) -- so
+  // this always expects exactly one closed loop, but defensively returns
+  // the largest if more than one ever turns up.
+  function marchingSquaresBoundary(){
+    const isIn = (x,y) => pixels[(y*COL_SIZE+x)*4] > 0.5;
+    const midpoint = new Map(); // canonical edge id -> [x,y] grid-space midpoint
+    const segs = []; // pairs of edge ids, one per boundary crossing
+    function hId(gx,gy){ const id = 'h,'+gx+','+gy; if(!midpoint.has(id)) midpoint.set(id,[gx+0.5,gy]); return id; }
+    function vId(gx,gy){ const id = 'v,'+gx+','+gy; if(!midpoint.has(id)) midpoint.set(id,[gx,gy+0.5]); return id; }
+    for (let y=0;y<COL_SIZE-1;y++){
+      for (let x=0;x<COL_SIZE-1;x++){
+        const tl=isIn(x,y), tr=isIn(x+1,y), br=isIn(x+1,y+1), bl=isIn(x,y+1);
+        const c = (tl?1:0)|(tr?2:0)|(br?4:0)|(bl?8:0);
+        if (c===0 || c===15) continue;
+        const top=hId(x,y), bottom=hId(x,y+1), left=vId(x,y), right=vId(x+1,y);
+        // Standard marching-squares case table (TL=1,TR=2,BR=4,BL=8).
+        // Cases 5 and 10 are the ambiguous "diagonal corners" saddle --
+        // resolved here by always treating the two corners as separate
+        // (not diagonally connected), a fixed, arbitrary tie-break with
+        // no universally "correct" answer; see PLAN.md.
+        switch(c){
+          case 1: segs.push([top,left]); break;
+          case 2: segs.push([top,right]); break;
+          case 3: segs.push([left,right]); break;
+          case 4: segs.push([right,bottom]); break;
+          case 5: segs.push([top,left]); segs.push([right,bottom]); break;
+          case 6: segs.push([top,bottom]); break;
+          case 7: segs.push([left,bottom]); break;
+          case 8: segs.push([bottom,left]); break;
+          case 9: segs.push([top,bottom]); break;
+          case 10: segs.push([top,right]); segs.push([bottom,left]); break;
+          case 11: segs.push([right,bottom]); break;
+          case 12: segs.push([left,right]); break;
+          case 13: segs.push([top,right]); break;
+          case 14: segs.push([top,left]); break;
+        }
       }
-      // Forward shear into equal-angle physical space -- see engine.js's
-      // FS_VIEW_SRC comment for the derivation of this exact formula.
-      const lx = dx*lastR, ly = dy*lastR;
-      pts.push([lx - 0.5*ly, ly*Math.sqrt(3)/2]);
     }
-    return pts;
+    if (segs.length === 0) return [];
+    const adj = new Map();
+    for (const [a,b] of segs){
+      if (!adj.has(a)) adj.set(a,[]);
+      if (!adj.has(b)) adj.set(b,[]);
+      adj.get(a).push(b);
+      adj.get(b).push(a);
+    }
+    const visited = new Set();
+    let best = [];
+    for (const startId of adj.keys()){
+      if (visited.has(startId)) continue;
+      const loop = [];
+      let prev = null, curr = startId;
+      while (curr != null && !visited.has(curr)){
+        visited.add(curr);
+        loop.push(curr);
+        const neighbors = adj.get(curr) || [];
+        const next = neighbors.find(n => n !== prev);
+        prev = curr;
+        curr = next === undefined ? neighbors[0] : next;
+        if (curr === startId) break;
+      }
+      if (loop.length > best.length) best = loop;
+    }
+    return best.map(id => midpoint.get(id));
+  }
+  // Ramer-Douglas-Peucker simplification of a CLOSED polygon: rotate to
+  // start at an extreme (stable, far-apart) point so the open-path RDP
+  // below has two well-separated anchors, run it, then drop the
+  // duplicated closing point. Pixel-precise marching squares on a 384x384
+  // grid can return thousands of points on a long run's most-developed
+  // frame; this brings that down to a size ExtrudeGeometry can rebuild
+  // every rendered frame during playback without becoming the bottleneck,
+  // while keeping real concave detail an angle-sampled radial trace
+  // would have discarded outright.
+  // Splits the loop at two well-separated points (the min-x point and its
+  // opposite by array index) into two OPEN arcs, each simplified by
+  // standard RDP with those two points as fixed endpoints, then rejoined.
+  // A first version instead rotated the loop to start/end at one single
+  // anchor and ran RDP on that as one "open" path -- broken, because RDP
+  // measures distance from the chord between the array's first and last
+  // point, and a closed loop's first and last point are the same point,
+  // making that chord's length zero and its "distance" to every other
+  // point zero too, collapsing the entire polygon to one point on the
+  // very first call. Caught by inspecting rawLen vs. simplifiedLen
+  // directly rather than just eyeballing the render.
+  function simplifyClosedPolygon(points, epsilon){
+    if (points.length < 6) return points;
+    let a = 0;
+    for (let i=1;i<points.length;i++){
+      if (points[i][0] < points[a][0] || (points[i][0] === points[a][0] && points[i][1] < points[a][1])) a = i;
+    }
+    const b = (a + Math.floor(points.length/2)) % points.length;
+    function arc(from, to){
+      const out = [];
+      let i = from;
+      while (true){ out.push(points[i]); if (i === to) break; i = (i+1) % points.length; }
+      return out;
+    }
+    const s1 = rdp(arc(a,b), epsilon); // a..b, endpoints preserved
+    const s2 = rdp(arc(b,a), epsilon); // b..a, endpoints preserved
+    // s1 ends at b (s2's first point) and s2 ends at a (s1's first point,
+    // i.e. where the caller's implicit "close the loop" will land) --
+    // drop both to avoid duplicate vertices at the seams.
+    return s1.concat(s2.slice(1, -1));
+  }
+  function rdp(points, epsilon){
+    if (points.length < 3) return points.slice();
+    let maxDist = 0, idx = 0;
+    const [x1,y1] = points[0], [x2,y2] = points[points.length-1];
+    const dx = x2-x1, dy = y2-y1;
+    const len = Math.hypot(dx,dy) || 1;
+    for (let i=1;i<points.length-1;i++){
+      const [px,py] = points[i];
+      const d = Math.abs(dy*px - dx*py + x2*y1 - y2*x1) / len;
+      if (d > maxDist) { maxDist = d; idx = i; }
+    }
+    if (maxDist > epsilon){
+      const left = rdp(points.slice(0, idx+1), epsilon);
+      const right = rdp(points.slice(idx), epsilon);
+      return left.slice(0,-1).concat(right);
+    }
+    return [points[0], points[points.length-1]];
+  }
+  const RDP_EPSILON = 1.2; // pixel units in the unsheared lattice grid
+  function traceBoundary(){
+    const c = COL_SIZE/2;
+    const raw = marchingSquaresBoundary();
+    const simplified = simplifyClosedPolygon(raw, RDP_EPSILON);
+    // Forward shear into equal-angle physical space -- see engine.js's
+    // FS_VIEW_SRC comment for the derivation of this exact formula.
+    return simplified.map(([x,y]) => {
+      const lx = x-c, ly = y-c;
+      return [lx - 0.5*ly, ly*Math.sqrt(3)/2];
+    });
   }
 
   // numFrames only sizes chunkSteps (how often we capture) against the
@@ -277,7 +399,7 @@ async function growColumnCrystal({beta = 2.2, gamma = 0.50, sigma = 0.0006, aspe
   chunkSteps = Math.max(200, Math.round(targetRadiusFor(beta) / numFrames));
   const frames = []; // {points, attached}
   readback();
-  frames.push({points: radialBoundary(), attached: 1});
+  frames.push({points: traceBoundary(), attached: 1});
   let stepCap = targetRadiusFor(beta);
   const HARD_CAP = stepCap * 3;
   while (true){
@@ -286,7 +408,7 @@ async function growColumnCrystal({beta = 2.2, gamma = 0.50, sigma = 0.0006, aspe
     readback();
     let attached = 0;
     for (let i=0;i<COL_SIZE*COL_SIZE;i++) if (pixels[i*4]>0.5) attached++;
-    frames.push({points: radialBoundary(), attached});
+    frames.push({points: traceBoundary(), attached});
     if (onProgress) onProgress(Math.min(1, stepCount/stepCap));
     if (stepCount >= stepCap) {
       const radiusFrac = boundingRadiusFrac();
