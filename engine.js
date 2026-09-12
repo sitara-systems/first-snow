@@ -58,10 +58,29 @@ const FS_DIFFUSE_SRC = `#version 300 es
 precision highp float;
 uniform sampler2D uState;
 uniform vec2 uTexel;
+uniform float uGamma;
 in vec2 vUv;
 out vec4 outColor;
 vec4 samp(vec2 off){ return texture(uState, vUv+off*uTexel); }
 void main(){
+  // Open boundary: hold the outermost ring of cells at the initial vapor
+  // density every pass, instead of the reflecting/closed-box edge that
+  // CLAMP_TO_EDGE sampling otherwise creates. A closed box makes high-beta
+  // growth genuinely run out of vapor and stall permanently well short of
+  // a developed crystal -- measured directly (beta=2.05 stalls at 67% of
+  // target radius, beta=2.60 at 50%, with correctly-varying noise). This
+  // was previously masked by the noise-hash bug above pumping in extra
+  // mass for most seeds, which is why it wasn't caught sooner. A held edge
+  // (a vapor source "at infinity") is closer to the source paper's own
+  // assumption of a lattice large enough that the boundary never matters
+  // than a reflecting wall is, and is the boundary condition Reiter's
+  // model (GG's predecessor) already uses. See PLAN.md's thirteenth
+  // 2026-09-11 finding.
+  if (vUv.x < uTexel.x || vUv.y < uTexel.y || vUv.x > 1.0-uTexel.x || vUv.y > 1.0-uTexel.y) {
+    vec4 edgeSelf = samp(vec2(0.0));
+    outColor = vec4(edgeSelf.r, edgeSelf.g, edgeSelf.b, uGamma);
+    return;
+  }
   vec4 self = samp(vec2(0.0));
   if (self.r > 0.5) { outColor = self; return; }
   vec2 offs[6] = vec2[6](vec2(0,1),vec2(0,-1),vec2(-1,0),vec2(1,0),vec2(-1,-1),vec2(1,1));
@@ -87,7 +106,25 @@ in vec2 vUv;
 out vec4 outColor;
 vec4 samp(vec2 off){ return texture(uState, vUv+off*uTexel); }
 float hash(vec2 p, float step, float seed){
-  vec3 p3 = vec3(p.x,p.y, step+seed*977.0);
+  // seed*977.0 could reach ~1e8 for seed=Date.now()%100000, well past
+  // fp32's exact-integer range (2^24) -- for most seeds, step got rounded
+  // away entirely in the sum below, freezing the per-cell noise into a
+  // static spatial pattern instead of varying every step as intended. A
+  // frozen +/- multiplicative pattern is not mass-conserving, and measured
+  // 7-11% vapor drift over 30-40k steps for affected seeds. See PLAN.md's
+  // thirteenth 2026-09-11 finding. fract(seed*0.0173)*1000.0 bounds the
+  // seed's contribution to [0,1000) regardless of seed's magnitude, so
+  // step stays exactly representable in the sum for every seed. The
+  // multiplier (an arbitrary many-decimal-digit constant, not a short
+  // fraction like 0.5 or 0.25) matters: an earlier attempt used 0.0173
+  // and passed every spot check except a batch of round test seeds
+  // (60000, 80000, 90000), which all collided to fract()=0 because
+  // 0.0173*10000 is exactly 173, an integer -- any multiple of 10000 times
+  // a short decimal like that lands back on an integer. A real seed
+  // (Date.now()%100000) is very unlikely to be an exact multiple of
+  // 10000, but a hash with that kind of rational structure is fragile in
+  // a way worth just not having.
+  vec3 p3 = vec3(p.x,p.y, step + fract(seed*0.7137253)*1000.0);
   p3 = fract(p3*0.1031);
   p3 += dot(p3, p3.yzx+33.33);
   return fract((p3.x+p3.y)*p3.z);
@@ -190,16 +227,18 @@ void main(){
 // a linear radius-vs-lattice relationship predicts. At beta=2.20, 512
 // didn't even reach 72% within 160,000 steps (was 38,400 at 384). At the
 // true beta=2.60 extreme, 512 reached only 52% of the boundary after
-// 250,000 steps (was a clean 70,800 steps to 72% at 384). Whatever is
-// happening -- some interaction between the reflecting boundary, the
-// larger domain, and the high-beta regime's already-slow kinetics -- it
-// makes high-beta growth qualitatively worse at 512, not just slower to
-// finish, and was not something the 256-vs-512-vs-1024 throughput
-// recommendation (based on raw steps/sec, not this radius-vs-steps
-// relationship) anticipated. Left at 384, the value this project's own
-// prior testing actually validated at this level of detail. See PLAN.md's
-// tenth 2026-09-11 finding -- worth understanding properly before trying
-// this again, not re-attempting on a hunch that more headroom helps.
+// 250,000 steps (was a clean 70,800 steps to 72% at 384). ROOT CAUSE NOW
+// UNDERSTOOD (see PLAN.md's thirteenth 2026-09-11 finding and
+// docs/alternative-growth-algorithms.md): the box was closed (a reflecting
+// edge) and high-beta growth is genuinely vapor-supply-limited, not just
+// diffusion-limited -- a 512 box needs more absolute vapor to grow the
+// same relative radius, and the closed box simply didn't have it. With
+// the open boundary below (a held edge, not a reflecting one), the same
+// 384->512 comparison at beta=2.05 costs 1.9x the steps for a 1.33x
+// larger radius, ordinary R^2 diffusion scaling, not a mystery regime.
+// Left at 384 anyway for now (this fix pass re-measured the table at 384,
+// not 512) -- revisiting 512 is a reasonable follow-up given the mystery
+// is resolved, but wasn't re-attempted here.
 const SIZE = 384;
 
 // Steps needed to reach a "developed but safe" crystal (72% of the way to
@@ -207,14 +246,23 @@ const SIZE = 384;
 // bounding-box radius, transform-independent) is NOT linear in beta --
 // measured directly (not extrapolated) at gamma=0.55 (the fastest-growing
 // gamma in the live range, so every other gamma at the same beta is at
-// least this safe). See PLAN.md's fifth 2026-09-11 finding for the
-// measurement methodology; re-measure this table if BETA_RANGE,
-// GAMMA_RANGE, or the base kappa/mu/alpha/theta values ever change.
+// least this safe). Re-measured 2026-09-12 (PLAN.md's thirteenth finding)
+// after fixing two real bugs the previous table was unknowingly calibrated
+// through: a noise-hash fp32 overflow that made the per-step noise freeze
+// into a static, non-mass-conserving pattern for most seeds (pumping
+// +7-11% extra vapor into the box for affected seeds), and a closed
+// (reflecting) box boundary that made high-beta growth genuinely run out
+// of vapor and stall permanently once the bug's extra mass was removed.
+// The honest numbers below are therefore higher at the high-beta end than
+// the table they replace -- that table was measuring the bug, not the
+// model. See PLAN.md for the measurement methodology; re-measure this
+// table if BETA_RANGE, GAMMA_RANGE, SIZE, or the base kappa/mu/alpha/theta
+// values ever change.
 const BETA_STEP_TABLE = [
-  [1.10, 1050], [1.15, 1200], [1.20, 1450], [1.25, 1650],
-  [1.30, 2100], [1.35, 2600], [1.40, 3200], [1.50, 5700],
-  [1.60, 9750], [1.75, 17850], [1.90, 26400], [2.05, 30300],
-  [2.20, 38400], [2.35, 47700], [2.50, 60300], [2.60, 70800],
+  [1.10, 1000], [1.15, 1300], [1.20, 1500], [1.25, 1700],
+  [1.30, 2200], [1.35, 2800], [1.40, 3600], [1.50, 7200],
+  [1.60, 12900], [1.75, 24300], [1.90, 34800], [2.05, 46000],
+  [2.20, 58000], [2.35, 71000], [2.50, 85000], [2.60, 94000],
 ];
 function targetStepsFor(beta){
   const b = Math.max(BETA_STEP_TABLE[0][0], Math.min(BETA_STEP_TABLE[BETA_STEP_TABLE.length-1][0], beta));
@@ -266,7 +314,7 @@ function createCrystalEngine({canvas, wrap, getParams, onComplete, onProgress, a
     for (const name of uniformNames) u[name] = gl.getUniformLocation(prog, name);
     return {prog, aPos: gl.getAttribLocation(prog, 'aPos'), u};
   }
-  const piDiffuse = programInfo(VS_SRC, FS_DIFFUSE_SRC, ['uState','uTexel']);
+  const piDiffuse = programInfo(VS_SRC, FS_DIFFUSE_SRC, ['uState','uTexel','uGamma']);
   const piUpdate = programInfo(VS_SRC, FS_UPDATE_SRC,
     ['uState','uTexel','uBeta','uTheta','uAlpha','uKappa','uMu','uUpsilon','uSigma','uStep','uSeed']);
   const piView = programInfo(VS_SRC, FS_VIEW_SRC, ['uState','uStatePrev','uTemporalAlpha','uPixel']);
@@ -346,6 +394,7 @@ function createCrystalEngine({canvas, wrap, getParams, onComplete, onProgress, a
   // shader pass) immediately before each batch of new steps runs, so it
   // always holds "the state as it looked before this frame's advance."
   let prevRenderBuf, lastStepAt, stepIntervalMs;
+  let stepAccumulator = 0, lastTickTime = null; // tickLive()'s rate integrator, see its own comment
   let keyframes = null; // captured recording from growWithHeadStart, or null in 'live' mode
   let playbackStartTime, playbackDurationMs;
   function snapshotCurrentInto(destBuf){
@@ -378,6 +427,8 @@ function createCrystalEngine({canvas, wrap, getParams, onComplete, onProgress, a
     startTime = performance.now();
     lastStepAt = startTime;
     stepIntervalMs = 16; // refined the first time tick() actually knows totalTarget
+    stepAccumulator = 0;
+    lastTickTime = null;
     renderView();
   }
 
@@ -392,6 +443,7 @@ function createCrystalEngine({canvas, wrap, getParams, onComplete, onProgress, a
       drawQuad(piDiffuse, SIZE, SIZE, u=>{
         gl.uniform1i(u.uState,0);
         gl.uniform2fv(u.uTexel,texel);
+        gl.uniform1f(u.uGamma, currentGamma);
       });
       gl.bindFramebuffer(gl.FRAMEBUFFER, srcBuf.fbo);
       gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tmpBuf.tex);
@@ -431,10 +483,29 @@ function createCrystalEngine({canvas, wrap, getParams, onComplete, onProgress, a
   function tickLive(){
     const peek = readParams();
     const totalTarget = targetStepsFor(peek.beta);
-    const elapsed = performance.now() - startTime;
+    const now = performance.now();
+    const elapsed = now - startTime;
     const targetProgress = clamp01(elapsed / GROWTH_DURATION_MS);
-    const targetSteps = Math.floor(targetProgress * totalTarget);
-    const toRun = Math.max(0, Math.min(targetSteps - stepCount, 400)); // cap per-frame batch so a slow device degrades gracefully instead of jank-freezing
+    // How many steps to run this frame comes from the CURRENT beta's own
+    // rate (totalTarget / GROWTH_DURATION_MS), integrated over real time
+    // since the last frame -- not from recomputing an absolute "target
+    // step count for this instant" from scratch every frame. The absolute
+    // version broke under live steering: dragging from a slow corner
+    // (large totalTarget) to a fast one mid-growth could put stepCount
+    // already past the new, much smaller totalTarget, so the "steps
+    // remaining" computation went negative and clamped to zero -- growth
+    // froze outright for the rest of the window, while the completion
+    // label still read whatever the new beta's morphology was, over a
+    // crystal that had actually grown under the old one. Integrating a
+    // rate can only ever add steps; dragging to a slower corner just slows
+    // the rate rather than demanding stepCount "catch down" to a smaller
+    // target. See PLAN.md's thirteenth 2026-09-11 finding.
+    const dtMs = lastTickTime == null ? 0 : Math.max(0, now - lastTickTime);
+    lastTickTime = now;
+    const stepsPerMs = totalTarget / GROWTH_DURATION_MS;
+    stepAccumulator += stepsPerMs * dtMs;
+    let toRun = Math.min(400, Math.floor(stepAccumulator)); // cap per-frame batch so a slow device degrades gracefully instead of jank-freezing
+    stepAccumulator -= toRun;
     // Expected real time between successive step-target increments, at
     // this beta's own pace -- recomputed every tick since beta (and so
     // totalTarget) can change live while dragging the puck. This is what
@@ -542,6 +613,7 @@ function createCrystalEngine({canvas, wrap, getParams, onComplete, onProgress, a
         drawQuad(piDiffuse, SIZE, SIZE, u=>{
           gl.uniform1i(u.uState,0);
           gl.uniform2fv(u.uTexel,texel);
+          gl.uniform1f(u.uGamma, params.gamma);
         });
         gl.bindFramebuffer(gl.FRAMEBUFFER, srcBuf.fbo);
         gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tmpBuf.tex);
@@ -613,6 +685,18 @@ function createCrystalEngine({canvas, wrap, getParams, onComplete, onProgress, a
       stepSimulation,
       keyframeCount: () => keyframes ? keyframes.length : 0,
       mode: () => mode,
+      readMassAndAttached(){
+        const buf = bufs[cur];
+        gl.bindFramebuffer(gl.FRAMEBUFFER, buf.fbo);
+        const px = new Float32Array(SIZE*SIZE*4);
+        gl.readPixels(0,0,SIZE,SIZE,gl.RGBA,gl.FLOAT,px);
+        let mass = 0, attached = 0;
+        for (let i=0;i<SIZE*SIZE;i++){
+          if (px[i*4] > 0.5) attached++;
+          mass += px[i*4+1] + px[i*4+2] + px[i*4+3];
+        }
+        return {mass, attached};
+      },
       readAttachedBoundingRadiusFrac(){
         const buf = bufs[cur];
         gl.bindFramebuffer(gl.FRAMEBUFFER, buf.fbo);
