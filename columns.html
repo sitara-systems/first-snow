@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
-<title>First Snow — Columns (prototype)</title>
+<title>First Snow — Full Spectrum (prototype)</title>
 <style>
   html, body {
     margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden;
@@ -52,20 +52,25 @@
 <div id="stage">
   <div id="viewWrap">
     <canvas id="viewCanvas"></canvas>
-    <div id="note">Prototype — procedural z-axis, not a 3D physics simulation (see PLAN.md)</div>
+    <div id="note">Prototype — 2D growth is real; the z-axis is a procedural heuristic, not a 3D physics simulation (see PLAN.md)</div>
   </div>
   <div id="label"></div>
   <div id="formingMsg">Your crystal is forming</div>
   <div id="panel">
     <div class="slider-row">
+      <div class="slider-name">Branchiness</div>
+      <input type="range" id="sliderBranch" min="0" max="100" value="55">
+      <div class="slider-caps"><span>Smooth Plate</span><span>Feathery Fern</span></div>
+    </div>
+    <div class="slider-row">
+      <div class="slider-name">Density</div>
+      <input type="range" id="sliderDensity" min="0" max="100" value="50">
+      <div class="slider-caps"><span>Delicate</span><span>Lush</span></div>
+    </div>
+    <div class="slider-row">
       <div class="slider-name">Aspect</div>
       <input type="range" id="sliderAspect" min="0" max="100" value="45">
       <div class="slider-caps"><span>Squat Plate</span><span>Slender Needle</span></div>
-    </div>
-    <div class="slider-row">
-      <div class="slider-name">Facet</div>
-      <input type="range" id="sliderFacet" min="0" max="100" value="50">
-      <div class="slider-caps"><span>Rounder Hexagon</span><span>Sharper Hexagon</span></div>
     </div>
   </div>
   <div id="bottomBar">
@@ -75,9 +80,16 @@
   </div>
 </div>
 
+<script src="engine.js"></script>
 <script src="column-engine.js"></script>
 <script type="module">
 import * as THREE from './vendor/three/three.module.min.js';
+// engine.js is loaded above as a classic (non-module) script purely for
+// its shared constants/helpers (BETA_RANGE, GAMMA_RANGE, BETA_CURVE_POWER,
+// lerp, morphologyLabel) -- reused here so Branchiness/Density map onto
+// beta/gamma exactly the way sliders.html does, not a second guess at the
+// same mapping. createCrystalEngine() itself is never called; this page's
+// growth and rendering both go through column-engine.js/Three.js instead.
 
 // ---- Three.js scene: a minimal viewer for one extruded-hexagon mesh.
 // No OrbitControls addon vendored for this prototype -- a few lines of
@@ -156,11 +168,23 @@ render();
 const label = document.getElementById('label');
 const formingMsg = document.getElementById('formingMsg');
 const startBtn = document.getElementById('startBtn');
-const sliderIds = ['sliderAspect','sliderFacet'];
+const sliderIds = ['sliderBranch','sliderDensity','sliderAspect'];
 function setLocked(locked, text){
   for (const id of sliderIds) document.getElementById(id).disabled = locked;
   startBtn.disabled = locked;
   startBtn.textContent = text || (locked ? 'Growing…' : 'Grow');
+}
+
+// Same Branchiness/Density -> beta/gamma mapping as sliders.html's own
+// sliderParams() -- see that file's comment for the full reasoning (the
+// BETA_CURVE_POWER remap, the puck-inherited beta direction). Asymmetry
+// isn't exposed on this page; sigma stays at DEFAULT_SIGMA.
+function fullSpectrumParams(){
+  const branch = document.getElementById('sliderBranch').value / 100;
+  const density = document.getElementById('sliderDensity').value / 100;
+  const beta = BETA_RANGE[0] + (BETA_RANGE[1]-BETA_RANGE[0]) * Math.pow(1 - branch, BETA_CURVE_POWER);
+  const gamma = lerp(GAMMA_RANGE[0], GAMMA_RANGE[1], density);
+  return {beta, gamma};
 }
 
 const PLAYBACK_MS = 12000;
@@ -171,17 +195,16 @@ async function grow(){
   setLocked(true, 'Forming…');
   formingMsg.classList.add('show');
   const aspect = document.getElementById('sliderAspect').value/100; // 0..1
-  const facet = document.getElementById('sliderFacet').value/100; // 0..1
-  const aspectRatio = 0.15 + aspect*3.85; // squat plate (0.15x radius tall) .. slender needle (4x radius tall), untuned -- see column-engine.js
-  const beta = 1.9 + facet*0.7; // stay in the high-beta, low-branching "hexagon" band on purpose
-  frames = await growColumnCrystal({beta, aspectRatio, gamma: 0.50});
+  const aspectRatio = 0.15 + aspect*3.85; // squat plate (0.15x radius tall) .. slender needle (4x radius tall) AT FULL hexagonCompatibility -- untuned, see column-engine.js
+  const {beta, gamma} = fullSpectrumParams();
+  frames = await growColumnCrystal({beta, gamma, aspectRatio, sigma: DEFAULT_SIGMA});
   formingMsg.classList.remove('show');
   playbackStart = performance.now();
   setLocked(true, 'Growing…');
-  playbackTick();
+  playbackTick(beta);
 }
 
-function playbackTick(){
+function playbackTick(beta){
   if (!frames) return;
   const elapsed = performance.now() - playbackStart;
   const t = Math.max(0, Math.min(1, elapsed/PLAYBACK_MS));
@@ -192,10 +215,10 @@ function playbackTick(){
   const h = frames[i0].height + (frames[i1].height - frames[i0].height)*frac;
   buildMesh(frames[i0].points, h);
   if (t < 1) {
-    requestAnimationFrame(playbackTick);
+    requestAnimationFrame(() => playbackTick(beta));
   } else {
     setLocked(false);
-    label.textContent = frames.length > 1 ? 'Column crystal' : 'Seed';
+    label.textContent = morphologyLabel(beta);
     label.classList.add('show');
     autoRotate = true;
   }

@@ -17,6 +17,20 @@
 // a derived physical result -- flagged deliberately, per this project's
 // hard rules, rather than presented as a real 3D simulation.
 //
+// The full beta range (fern through simple plate) is accepted here, not
+// just the high-beta "hexagon" end -- see hexagonCompatibility() below.
+// Real snow crystals never come as extruded dendrites (a live report's
+// own framing), so height is tapered toward zero as beta moves into
+// branchy (fern/stellar-dendrite) territory, using the same beta bands
+// engine.js's morphologyLabel() already documents. The boundary trace
+// itself (radialBoundary, further down) is still a coarse 180-point
+// star-shaped approximation regardless of beta -- accurate for a solid
+// hexagon, a real simplification of a fern's fine sub-branch structure
+// (see PLAN.md). Tapering height to ~0 there hides most of that loss
+// (a near-flat mesh's silhouette fidelity matters less), but does not
+// eliminate it; this is a known, accepted limitation of one shared 3D
+// rendering path across the whole spectrum, not a fixed problem.
+//
 // Kept as a separate file from engine.js on purpose: this is a spike, and
 // duplicating the ~30 lines of shader/stepping plumbing it actually needs
 // is cheaper than risking a regression in the two shipped pages that
@@ -116,13 +130,15 @@ void main(){
 // then in a second pass assigns each captured frame a height via the
 // stall heuristic described at the top of this file.
 //
-// aspectRatio: total final height, as a multiple of the crystal's own
-// target xy radius (both in the same lattice-pixel units -- see
-// radialBoundary below) -- 0.15 reads as a squat plate, ~4 as a slender
-// needle. Untuned -- see PLAN.md's prototype finding. The *distribution*
-// of that fixed height budget across frames (not its total) is what the
-// stall heuristic controls: intervals where xy growth stalled get a
-// bigger share of it.
+// aspectRatio: total final height AT FULL hexagonCompatibility, as a
+// multiple of the crystal's own target xy radius (both in the same
+// lattice-pixel units -- see radialBoundary below) -- 0.15 reads as a
+// squat plate, ~4 as a slender needle. The ACTUAL total height is this
+// scaled by hexagonCompatibility(beta) (see below), so a low (fern) beta
+// ends up nearly flat regardless of aspectRatio. Untuned -- see PLAN.md's
+// prototype finding. The *distribution* of that budget across frames
+// (not its total) is what the stall heuristic controls: intervals where
+// xy growth stalled get a bigger share of it.
 async function growColumnCrystal({beta = 2.2, gamma = 0.50, sigma = 0.0006, aspectRatio = 0.8,
                                    numFrames = 90, chunkSteps = 2000, targetRadiusFrac = 0.72,
                                    onProgress} = {}){
@@ -229,13 +245,12 @@ async function growColumnCrystal({beta = 2.2, gamma = 0.50, sigma = 0.0006, aspe
     return Math.sqrt(maxR2)/c;
   }
   // Radial boundary trace, in LATTICE (unsheared) space, centered on the
-  // seed -- valid for the roughly-convex, low-branching blobs this
-  // prototype's forced high-beta parameters produce (see this file's top
-  // comment: "you only get extruded hexagons" is a real constraint, not
-  // just a description -- a fingered/dendritic mask would break the
-  // star-shaped assumption this ray march relies on). Cheap and avoids
-  // storing a full per-frame mask (147KB) -- 768 bytes/frame instead.
-  const NUM_RAYS = 96;
+  // seed. Exact for a solid hexagon; a coarse, star-shaped approximation
+  // of a fern's fine sub-branch structure (see this file's top comment).
+  // 180 rays (up from an initial 96) to give branchy shapes a somewhat
+  // better chance at resolving their 6 main arms. Cheap either way, and
+  // avoids storing a full per-frame mask (147KB) -- ~1.4KB/frame instead.
+  const NUM_RAYS = 180;
   function radialBoundary(){
     const c = COL_SIZE/2;
     const pts = [];
@@ -303,7 +318,7 @@ async function growColumnCrystal({beta = 2.2, gamma = 0.50, sigma = 0.0006, aspe
     totalWeight += w;
   }
   const targetRadiusLatticeUnits = targetRadiusFrac * (COL_SIZE/2);
-  const totalHeightBudget = aspectRatio * targetRadiusLatticeUnits;
+  const totalHeightBudget = aspectRatio * targetRadiusLatticeUnits * hexagonCompatibility(beta);
   let height = 0;
   frames[0].height = 0;
   for (let i=1;i<frames.length;i++){
@@ -314,6 +329,23 @@ async function growColumnCrystal({beta = 2.2, gamma = 0.50, sigma = 0.0006, aspe
   gl.deleteTexture(bufs[0].tex); gl.deleteTexture(bufs[1].tex);
   gl.deleteFramebuffer(bufs[0].fbo); gl.deleteFramebuffer(bufs[1].fbo);
   return frames.map(f => ({points: f.points, height: f.height}));
+}
+
+// Real snow crystals never come as extruded dendrites -- see this file's
+// top comment. Tapers the total height budget to 0 through the fern/
+// stellar-dendrite bands (beta <= 1.60, matching engine.js's own
+// morphologyLabel thresholds exactly) and to full strength by the start
+// of the simple-plate band (beta >= 2.00); ramps through the sectored-
+// plate band in between, where real crystals do start showing more
+// hexagonal, less-fingered structure. Smoothstep, not linear, so the
+// transition doesn't have a visible kink at either edge. The two edges
+// are chosen to line up with morphologyLabel's own bands, not
+// independently measured -- same "designed, not derived" caveat as the
+// rest of this file.
+function hexagonCompatibility(beta){
+  const e0 = 1.60, e1 = 2.00;
+  const t = Math.max(0, Math.min(1, (beta-e0)/(e1-e0)));
+  return t*t*(3-2*t);
 }
 
 // Local copy of engine.js's targetStepsFor/BETA_STEP_TABLE (paces the
