@@ -272,6 +272,19 @@ function targetStepsFor(beta){
   }
   return BETA_STEP_TABLE[BETA_STEP_TABLE.length-1][1];
 }
+// The table above is calibrated at a single gamma (0.55, the fastest in
+// GAMMA_RANGE) and used only to PACE growth -- it estimates how many steps
+// a beta needs so stepping can be spread smoothly over a real-time window.
+// At other gamma values actual growth is slower per step than that
+// estimate, so a crystal could reach `targetProgress>=1` without having
+// actually grown to a comparable size, reading as "small" -- a live report
+// asked for consistent final size over consistent duration. TARGET_RADIUS_
+// FRAC is the real completion criterion both growth modes check directly
+// (bounding-box radius of attached cells, transform-independent, the same
+// metric the table itself was calibrated against): a crystal is only done
+// once it actually measures this large, however many steps or how much
+// real time that takes.
+const TARGET_RADIUS_FRAC = 0.72;
 // Every crystal grows for the same fixed real-world duration, regardless
 // of its step budget -- a deliberate product decision (every visitor gets
 // the same-length moment, and a progress bar showing "how much is left"
@@ -395,6 +408,9 @@ function createCrystalEngine({canvas, wrap, getParams, onComplete, onProgress, a
   // always holds "the state as it looked before this frame's advance."
   let prevRenderBuf, lastStepAt, stepIntervalMs;
   let stepAccumulator = 0, lastTickTime = null; // tickLive()'s rate integrator, see its own comment
+  let lastLiveRadiusCheckAt = 0, lastLiveRadiusFrac = 0; // tickLive()'s throttled TARGET_RADIUS_FRAC check
+  const LIVE_RADIUS_CHECK_MS = 400;
+  const LIVE_HARD_CAP_MS = GROWTH_DURATION_MS * 3; // safety valve, see tickLive()
   let keyframes = null; // captured recording from growWithHeadStart, or null in 'live' mode
   let playbackStartTime, playbackDurationMs;
   function snapshotCurrentInto(destBuf){
@@ -402,6 +418,29 @@ function createCrystalEngine({canvas, wrap, getParams, onComplete, onProgress, a
     gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, destBuf.fbo);
     gl.blitFramebuffer(0,0,SIZE,SIZE, 0,0,SIZE,SIZE, gl.COLOR_BUFFER_BIT, gl.NEAREST);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  }
+  // The real "are we done" check for TARGET_RADIUS_FRAC: full readback of
+  // whichever buffer is passed (bufs[cur] for 'live' mode, a headstart
+  // compute buffer for 'headstart' mode) and a scan for the farthest
+  // attached cell from center. This is the same metric BETA_STEP_TABLE was
+  // calibrated against, just measured directly instead of assumed from the
+  // table. Not cheap (SIZE^2 readback + scan), so callers throttle how
+  // often they call this rather than doing it every frame/chunk.
+  const radiusPixels = new Float32Array(SIZE*SIZE*4);
+  function measureBoundingRadiusFrac(buf){
+    gl.bindFramebuffer(gl.FRAMEBUFFER, buf.fbo);
+    gl.readPixels(0,0,SIZE,SIZE,gl.RGBA,gl.FLOAT,radiusPixels);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    const c = SIZE/2;
+    let maxR = 0;
+    for (let y=0;y<SIZE;y++) for (let x=0;x<SIZE;x++){
+      if (radiusPixels[(y*SIZE+x)*4] > 0.5){
+        const dx=x-c, dy=y-c;
+        const r2 = dx*dx+dy*dy;
+        if (r2>maxR) maxR = r2;
+      }
+    }
+    return Math.sqrt(maxR)/c;
   }
   function freeKeyframes(){
     if (keyframes) { for (const kf of keyframes) { gl.deleteTexture(kf.tex); gl.deleteFramebuffer(kf.fbo); } }
@@ -484,6 +523,8 @@ function createCrystalEngine({canvas, wrap, getParams, onComplete, onProgress, a
     stepIntervalMs = 16; // refined the first time tick() actually knows totalTarget
     stepAccumulator = 0;
     lastTickTime = null;
+    lastLiveRadiusCheckAt = 0;
+    lastLiveRadiusFrac = 0;
     renderView();
   }
 
@@ -572,8 +613,28 @@ function createCrystalEngine({canvas, wrap, getParams, onComplete, onProgress, a
       lastStepAt = performance.now();
     }
     renderView();
-    if (onProgress) onProgress(targetProgress, Math.max(0, GROWTH_DURATION_MS - elapsed));
-    if (targetProgress >= 1) {
+    if (targetProgress < 1) {
+      if (onProgress) onProgress(targetProgress, Math.max(0, GROWTH_DURATION_MS - elapsed));
+      return;
+    }
+    // GROWTH_DURATION_MS's table-based step estimate has run out. Rather
+    // than declare the crystal done here (the table is only calibrated at
+    // one gamma -- see its comment -- so at other gammas the crystal may
+    // still be under TARGET_RADIUS_FRAC at this point, reading as "small"),
+    // measure the real bounding radius and keep stepping at the same rate
+    // past the estimated duration until it actually reaches target, or
+    // until LIVE_HARD_CAP_MS is hit as a safety valve against a badly
+    // mis-estimated combination running forever. Throttled to once every
+    // LIVE_RADIUS_CHECK_MS of wall time -- it's a full SIZE^2 readback, too
+    // expensive to call every frame.
+    if (now - lastLiveRadiusCheckAt > LIVE_RADIUS_CHECK_MS) {
+      lastLiveRadiusFrac = measureBoundingRadiusFrac(bufs[cur]);
+      lastLiveRadiusCheckAt = now;
+    }
+    const sizeReached = lastLiveRadiusFrac >= TARGET_RADIUS_FRAC;
+    const hardCapped = elapsed >= LIVE_HARD_CAP_MS;
+    if (onProgress) onProgress(1, 0);
+    if (sizeReached || hardCapped) {
       running = false;
       // Force the crossfade fully settled on the frame that holds --
       // without this, a completion landing mid-fade would freeze on a
@@ -648,8 +709,15 @@ function createCrystalEngine({canvas, wrap, getParams, onComplete, onProgress, a
     stepCount = 0;
     seed = Date.now() % 100000;
 
-    const totalTarget = targetStepsFor(params.beta);
-    const kfInterval = Math.max(1, Math.round(totalTarget / numKeyframes));
+    const initialEstimate = targetStepsFor(params.beta);
+    const kfInterval = Math.max(1, Math.round(initialEstimate / numKeyframes));
+    // The table's estimate paces keyframe density, but the real completion
+    // check is TARGET_RADIUS_FRAC (see its comment) -- if the crystal isn't
+    // there yet once the estimate runs out, extend the step budget by 50%
+    // and keep going, up to this hard cap so a badly-mispredicted (beta,
+    // gamma) combination can't loop forever.
+    let stepCap = initialEstimate;
+    const HARD_STEP_CAP = initialEstimate * 3;
     keyframes = [];
     function captureKeyframe(){ const kf = makeState(SIZE); snapshotCurrentInto(kf); keyframes.push(kf); }
     captureKeyframe(); // the seed itself, so playback starts from a single point like 'live' mode does
@@ -693,28 +761,37 @@ function createCrystalEngine({canvas, wrap, getParams, onComplete, onProgress, a
 
     return new Promise(resolve => {
       function computeChunk(){
-        const thisChunk = Math.min(chunkSteps, totalTarget - stepCount);
+        const thisChunk = Math.min(chunkSteps, stepCap - stepCount);
         let ran = 0;
         while (ran < thisChunk) {
           const toNextKf = kfInterval - (stepCount % kfInterval);
           const sub = Math.min(thisChunk - ran, toNextKf);
           stepFixed(sub);
           ran += sub;
-          if (stepCount % kfInterval === 0 || stepCount >= totalTarget) captureKeyframe();
+          if (stepCount % kfInterval === 0 || stepCount >= stepCap) captureKeyframe();
         }
-        if (onComputeProgress) onComputeProgress(clamp01(stepCount / totalTarget));
-        if (stepCount < totalTarget) {
+        if (onComputeProgress) onComputeProgress(clamp01(stepCount / initialEstimate));
+        if (stepCount < stepCap) {
           setTimeout(computeChunk, 0); // yield between chunks so the tab/UI stays responsive
-        } else {
-          if (keyframes.length < 2) captureKeyframe(); // guard against a degenerate tiny step budget
-          dropStaticKeyframes();
-          mode = 'playback';
-          playbackStartTime = performance.now();
-          playbackDurationMs = playbackMs;
-          running = true; // the existing frame()/rAF loop now drives tickPlayback()
-          if (onComputeDone) onComputeDone();
-          resolve();
+          return;
         }
+        // stepCap reached -- check the real size before declaring done (see
+        // TARGET_RADIUS_FRAC's comment); extend and keep going if it's not
+        // there yet, instead of handing playback an undersized crystal.
+        const radiusFrac = measureBoundingRadiusFrac(bufs[cur]);
+        if (radiusFrac < TARGET_RADIUS_FRAC && stepCap < HARD_STEP_CAP) {
+          stepCap = Math.min(HARD_STEP_CAP, Math.round(stepCap * 1.5));
+          setTimeout(computeChunk, 0);
+          return;
+        }
+        if (keyframes.length < 2) captureKeyframe(); // guard against a degenerate tiny step budget
+        dropStaticKeyframes();
+        mode = 'playback';
+        playbackStartTime = performance.now();
+        playbackDurationMs = playbackMs;
+        running = true; // the existing frame()/rAF loop now drives tickPlayback()
+        if (onComputeDone) onComputeDone();
+        resolve();
       }
       computeChunk();
     });
@@ -753,22 +830,7 @@ function createCrystalEngine({canvas, wrap, getParams, onComplete, onProgress, a
         }
         return {mass, attached};
       },
-      readAttachedBoundingRadiusFrac(){
-        const buf = bufs[cur];
-        gl.bindFramebuffer(gl.FRAMEBUFFER, buf.fbo);
-        const px = new Float32Array(SIZE*SIZE*4);
-        gl.readPixels(0,0,SIZE,SIZE,gl.RGBA,gl.FLOAT,px);
-        const c = SIZE/2;
-        let maxR = 0;
-        for (let y=0;y<SIZE;y++) for (let x=0;x<SIZE;x++){
-          if (px[(y*SIZE+x)*4] > 0.5){
-            const dx=x-c, dy=y-c;
-            const r = Math.sqrt(dx*dx+dy*dy);
-            if (r>maxR) maxR = r;
-          }
-        }
-        return maxR/c;
-      },
+      readAttachedBoundingRadiusFrac(){ return measureBoundingRadiusFrac(bufs[cur]); },
     },
   };
 }
