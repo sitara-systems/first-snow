@@ -99,15 +99,55 @@ import * as THREE from './vendor/three/three.module.min.js';
 const canvas = document.getElementById('viewCanvas');
 const renderer = new THREE.WebGLRenderer({canvas, antialias: true, alpha: true});
 renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
+// Physically-based transmission/clearcoat (below) needs correct color
+// management and a filmic rolloff to avoid blown-out highlights --
+// without these two lines the ice reads as flat/washed-out regardless
+// of the material settings.
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.1;
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(35, 1, 0.1, 100);
-scene.add(new THREE.AmbientLight(0xffffff, 0.55));
-const key = new THREE.DirectionalLight(0xffffff, 1.1);
+// Cool hemisphere fill (icy-sky-blue from above, near-black from below)
+// reads as ambient occlusion/bounce light for free, and is the single
+// biggest lever on "looks like ice" vs. "looks like grey plastic".
+scene.add(new THREE.HemisphereLight(0xbfe0ff, 0x05070a, 0.7));
+const key = new THREE.DirectionalLight(0xffffff, 1.6);
 key.position.set(2.5, 3.5, 2.5);
 scene.add(key);
-const rim = new THREE.DirectionalLight(0x8fb0ff, 0.4);
-rim.position.set(-2, -1, -2);
+const rim = new THREE.DirectionalLight(0x8fb0ff, 0.7);
+rim.position.set(-2, -1, -2.5);
 scene.add(rim);
+const fill = new THREE.DirectionalLight(0xaad4ff, 0.35);
+fill.position.set(-1.5, 2, 1.8);
+scene.add(fill);
+
+// A tiny procedural sky-to-ground gradient, used ONLY to light the ice
+// (scene.environment) -- not shown as the page's own background, which
+// stays the transparent dark canvas it always was. This is what gives
+// MeshPhysicalMaterial's clearcoat/transmission something believable to
+// reflect without needing an external HDRI file (this app has to work
+// offline on the tablet -- see PLAN.md's hard rules).
+function makeEnvTexture(){
+  const c = document.createElement('canvas');
+  c.width = 16; c.height = 128;
+  const ctx = c.getContext('2d');
+  const g = ctx.createLinearGradient(0, 0, 0, 128);
+  g.addColorStop(0.0, '#dbeeff');
+  g.addColorStop(0.45, '#5578a8');
+  g.addColorStop(1.0, '#020305');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, 16, 128);
+  const tex = new THREE.CanvasTexture(c);
+  tex.mapping = THREE.EquirectangularReflectionMapping;
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+const pmrem = new THREE.PMREMGenerator(renderer);
+const envTex = makeEnvTexture();
+scene.environment = pmrem.fromEquirectangular(envTex).texture;
+envTex.dispose();
+pmrem.dispose();
 
 let orbitAz = 0.6, orbitEl = 0.35, autoRotate = true;
 let dragging = false, lastX = 0, lastY = 0;
@@ -131,7 +171,28 @@ window.addEventListener('resize', resize);
 resize();
 
 let mesh = null;
-const material = new THREE.MeshStandardMaterial({color: 0xdfeaff, metalness: 0.05, roughness: 0.25, flatShading: false});
+// Ice, not plastic: transmission (see-through with real refraction,
+// ior=1.31 is water ice's actual value) + clearcoat (the wet-looking
+// glassy top layer real ice/snow crystals show) + a pale blue tint via
+// attenuationColor (transmitted light picks up color with distance
+// through the material, same as looking through a thick piece of ice).
+// transparent+opacity is a small extra fade on top for cheap depth cues
+// even in viewing angles where transmission alone reads as fully clear.
+const material = new THREE.MeshPhysicalMaterial({
+  color: 0xd8ebff,
+  metalness: 0.0,
+  roughness: 0.16,
+  transmission: 0.55,
+  thickness: 0.6,
+  ior: 1.31,
+  clearcoat: 0.6,
+  clearcoatRoughness: 0.12,
+  attenuationColor: new THREE.Color(0x8fc7ff),
+  attenuationDistance: 1.1,
+  transparent: true,
+  opacity: 0.92,
+  side: THREE.DoubleSide,
+});
 // World-scale: radialBoundary()'s points are in lattice-pixel units
 // (roughly up to ~190 at full growth); shrink to a friendlier scene scale.
 const WORLD_SCALE = 1/140;
